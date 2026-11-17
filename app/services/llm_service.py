@@ -349,21 +349,21 @@ def execute_tool(tool_name: str, arguments: dict):
         }
 
 
-def ask_ollama(
-    db: Session,
-    conversation_id: int,
-    user_message: str,
-) -> str:
+def ask_ollama(db: Session, conversation_id: int, user_message: str) -> str:
 
-    # Load previous messages from SQLite.
+    # Import here to avoid a circular import
+    from app.agent.workflow import run_agent
+
+    # Retrieve previous conversation messages
     history = get_conversation_history(
-    db=db,
-    conversation_id=conversation_id,
+        db=db,
+        conversation_id=conversation_id,
     )
 
     # Keep only the 10 most recent previous messages
     history = history[-MAX_PREVIOUS_MESSAGES:]
-    # Save the new user message.
+
+    # Save the new user message in SQLite
     save_message(
         db=db,
         conversation_id=conversation_id,
@@ -371,88 +371,20 @@ def ask_ollama(
         content=user_message,
     )
 
-    # Build the conversation context.
+    # Prepare the initial agent context
     messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT,
-        },
+        {"role": "system", "content": SYSTEM_PROMPT},
         *history,
-        {
-            "role": "user",
-            "content": user_message,
-        },
+        {"role": "user", "content": user_message},
     ]
 
-    # Allow up to MAX_ROUNDS of model/tool interaction.
-    for _ in range(MAX_ROUNDS):
-        try:
-            response = requests.post(
-                OLLAMA_URL,
-                json={
-                    "model": MODEL_NAME,
-                    "messages": messages,
-                    "tools": tools,
-                    "stream": False,
-                },
-                timeout=120,
-            )
+    # Execute the LangGraph workflow
+    answer = run_agent(
+        conversation_id=conversation_id,
+        messages=messages,
+    )
 
-            response.raise_for_status()
-
-        except requests.RequestException:
-            answer = (
-                "Unable to connect to Ollama. "
-                "Please check whether the local AI model is running."
-            )
-
-            save_message(db, conversation_id, "assistant", answer)
-            return answer
-
-        result = response.json()
-        assistant_message = result["message"]
-
-        # Keep the assistant response in the current LLM context.
-        messages.append(assistant_message)
-
-        tool_calls = assistant_message.get("tool_calls", [])
-
-        # No more tool requests: save and return final answer.
-        if not tool_calls:
-            answer = assistant_message.get("content", "")
-
-            save_message(
-                db=db,
-                conversation_id=conversation_id,
-                role="assistant",
-                content=answer,
-            )
-
-            return answer
-
-        # Execute every requested tool.
-        for tool_call in tool_calls:
-            function = tool_call["function"]
-
-            tool_name = function["name"]
-            arguments = function["arguments"]
-
-            tool_result = execute_tool(
-                tool_name=tool_name,
-                arguments=arguments,
-            )
-
-            # Send the execution result back to Ollama.
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_name": tool_name,
-                    "content": json.dumps(tool_result, default=str),
-                }
-            )
-
-    answer = "I couldn't complete the request " "within the allowed tool-call limit."
-
+    # Save the final assistant response
     save_message(
         db=db,
         conversation_id=conversation_id,
