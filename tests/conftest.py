@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -13,11 +11,11 @@ from main import app
 
 
 @pytest.fixture(autouse=True)
-def disable_live_gemini_calls(monkeypatch):
-    # API CRUD tests must not hit Gemini even when the developer's .env has a key.
+def disable_live_embedding_calls(monkeypatch):
+    # CRUD tests must not call Ollama or Gemini, even when configured in .env.
     monkeypatch.setattr(
-        "app.services.task_service.get_settings",
-        lambda: SimpleNamespace(gemini_api_key=""),
+        "app.services.task_service.embedding_provider_configured",
+        lambda: False,
     )
 
 
