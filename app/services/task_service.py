@@ -8,6 +8,7 @@ from app.services.vector_service import (
     delete_task_vector,
     embedding_provider_configured,
     index_task,
+    invalidate_embedding_cache,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,11 @@ def update_task(db, user_id: str, task_id, task_data):
     # Regenerate embedding only if indexed text changed.
     new_text = (task.title, task.description)
 
+    if old_text != new_text:
+        old_content = f"Title: {old_text[0]}\nDescription: {old_text[1] or ''}"
+        invalidate_embedding_cache(user_id, old_content)
+        # Keep stale source text out of semantic retrieval if reindexing fails.
+        delete_task_vector(db, task_id)
     if old_text != new_text and embedding_provider_configured():
         try:
             index_task(db, user_id, task.id, task.title, task.description)
@@ -116,6 +122,11 @@ def delete_task(db, user_id: str, task_id):
 
     if task is None:
         return False
+
+    invalidate_embedding_cache(
+        user_id,
+        f"Title: {task.title}\nDescription: {task.description or ''}",
+    )
 
     db.delete(task)
     db.commit()

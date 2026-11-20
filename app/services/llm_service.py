@@ -21,26 +21,25 @@ from app.services.conversation_service import (
     get_conversation_history,
     save_message,
 )
+from app.services.model_router import resolve_route
 
-settings = get_settings()
-AI_PROVIDER = settings.ai_provider.strip().lower()
-MODEL_NAME = (
-    settings.ollama_model if AI_PROVIDER == "ollama" else settings.gemini_model
-)
+CHAT_ROUTE = resolve_route("chat")
+AI_PROVIDER = CHAT_ROUTE.provider
+MODEL_NAME = CHAT_ROUTE.model
 MAX_ROUNDS = 5
 MAX_PREVIOUS_MESSAGES = 10
 
 
-def get_llm_client():
+def get_llm_client(provider: str | None = None):
     from openai import OpenAI
 
     settings = get_settings()
-    provider = settings.ai_provider.strip().lower()
+    provider = provider or resolve_route("chat").provider
     if provider == "ollama":
         return OpenAI(
             api_key="ollama",
             base_url=f"{settings.ollama_base_url.rstrip('/')}/",
-            timeout=120,
+            timeout=settings.ai_timeout_seconds,
             max_retries=0,
         )
     raise RuntimeError("OpenAI-compatible client is only used with Ollama")
@@ -56,13 +55,15 @@ def get_gemini_client():
     return genai.Client(
         api_key=settings.gemini_api_key,
         http_options=types.HttpOptions(
-            timeout=30_000,
+            timeout=int(get_settings().ai_timeout_seconds * 1000),
             retry_options=types.HttpRetryOptions(attempts=1),
         ),
     )
 
 
-def generate_gemini_message(messages: list[dict], function_tools: list[dict]):
+def generate_gemini_message(
+    messages: list[dict], function_tools: list[dict], model: str | None = None
+):
     import uuid
 
     from google.genai import types
@@ -104,9 +105,7 @@ def generate_gemini_message(messages: list[dict], function_tools: list[dict]):
                 arguments = json.loads(function.get("arguments") or "{}")
                 call_names[call["id"]] = function["name"]
                 parts.append(
-                    types.Part.from_function_call(
-                        name=function["name"], args=arguments
-                    )
+                    types.Part.from_function_call(name=function["name"], args=arguments)
                 )
             if parts:
                 contents.append(types.Content(role="model", parts=parts))
@@ -148,16 +147,12 @@ def generate_gemini_message(messages: list[dict], function_tools: list[dict]):
     config = types.GenerateContentConfig(
         system_instruction="\n\n".join(system_instructions) or None,
         tools=(
-            [types.Tool(function_declarations=declarations)]
-            if declarations
-            else None
+            [types.Tool(function_declarations=declarations)] if declarations else None
         ),
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(
-            disable=True
-        ),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
     response = client.models.generate_content(
-        model=settings.gemini_model,
+        model=model or resolve_route("chat").model,
         contents=contents,
         config=config,
     )
@@ -192,6 +187,33 @@ def generate_gemini_message(messages: list[dict], function_tools: list[dict]):
         "tool_calls": tool_calls,
         "_gemini_content": raw_content,
     }
+
+
+def generate_chat_message(route, messages: list[dict], function_tools: list[dict]):
+    if route.provider == "gemini":
+        return generate_gemini_message(messages, function_tools, model=route.model)
+    if route.provider == "ollama":
+        response = get_llm_client(provider=route.provider).chat.completions.create(
+            model=route.model,
+            messages=messages,
+            tools=function_tools,
+        )
+        choice = response.choices[0].message
+        return {
+            "content": choice.content or "",
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    },
+                }
+                for call in (choice.tool_calls or [])
+            ],
+        }
+    raise RuntimeError(f"Unsupported AI provider: {route.provider}")
 
 
 class ListTasksArgs(BaseModel):

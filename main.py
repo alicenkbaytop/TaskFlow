@@ -11,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.chat import router as chat_router
+from app.api.google_auth import router as google_auth_router
 from app.api.tasks import router as tasks_router
 from app.core.config import get_settings
 from app.core.logging_config import setup_logging
@@ -65,6 +66,7 @@ async def log_requests(request: Request, call_next):
 
 app.include_router(tasks_router, prefix="/tasks", tags=["tasks"])
 app.include_router(chat_router, prefix="/chat", tags=["chat"])
+app.include_router(google_auth_router, prefix="/auth", tags=["authentication"])
 
 
 @app.get("/health")

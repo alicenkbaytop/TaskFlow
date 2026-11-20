@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 
-def setting(name, default=""):
+def setting(name: str, default: str = "") -> str:
     if name in os.environ:
         return os.environ[name]
     try:
@@ -20,600 +20,754 @@ def setting(name, default=""):
 API_URL = setting("TASKFLOW_API_URL", "http://localhost:8000").rstrip("/")
 SUPABASE_URL = setting("SUPABASE_URL").rstrip("/")
 SUPABASE_ANON_KEY = setting("SUPABASE_ANON_KEY")
-PAGE_SIZE = 10
+PAGE_SIZE = 100
+STATUSES = {
+    "pending": "To do",
+    "in_progress": "In progress",
+    "completed": "Completed",
+}
 
-st.set_page_config(page_title="TaskFlow", page_icon="✅", layout="wide")
-
-# -------------------------
-# Styling
-# -------------------------
+st.set_page_config(page_title="TaskFlow", page_icon="✓", layout="wide")
 
 st.markdown(
     """
     <style>
-        .block-container {
-            max-width: 1050px;
-            padding-top: 2rem;
-            padding-bottom: 3rem;
-        }
-
-        h1 {
-            font-weight: 700;
-            letter-spacing: -1px;
-        }
-
-        .subtitle {
-            color: #808495;
-            margin-top: -12px;
-            margin-bottom: 25px;
-        }
-
-        div[data-testid="stVerticalBlockBorderWrapper"] {
-            border-radius: 12px;
-        }
-
-        div[data-testid="stExpander"] {
-            border-radius: 10px;
-        }
-
-        .task-meta {
-            color: #808495;
-            font-size: 13px;
-        }
+    :root {
+        --ink: #20242c;
+        --muted: #737b88;
+        --line: #e7e9ed;
+        --surface: #ffffff;
+        --canvas: #f7f8fa;
+        --accent: #4257a5;
+        --accent-soft: #eef1fb;
+    }
+    .stApp { background: var(--canvas); color: var(--ink); }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stSidebar"] {
+        background: var(--surface);
+        border-right: 1px solid var(--line);
+    }
+    [data-testid="stSidebar"] > div:first-child { padding-top: 1.3rem; }
+    .block-container { max-width: 1320px; padding: 2rem 2.6rem 4rem; }
+    h1, h2, h3 { color: var(--ink); letter-spacing: -0.035em; }
+    h1 { font-size: 2rem; font-weight: 650; }
+    h2 { font-size: 1.38rem; font-weight: 620; }
+    h3 { font-size: 1.04rem; font-weight: 620; }
+    p, label, .stCaption { color: var(--muted); }
+    [data-testid="stMetric"] {
+        background: var(--surface); border: 1px solid var(--line);
+        border-radius: 12px; padding: 1rem 1.1rem;
+    }
+    [data-testid="stMetricLabel"] p { color: var(--muted); font-size: .82rem; }
+    [data-testid="stMetricValue"] { color: var(--ink); font-size: 1.75rem; }
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        border-color: var(--line); border-radius: 12px; background: var(--surface);
+    }
+    .stButton > button, .stFormSubmitButton > button {
+        border-radius: 8px; min-height: 2.55rem; font-weight: 560;
+        border-color: var(--line);
+        transition: border-color .15s ease, background .15s ease;
+    }
+    .stButton > button:hover, .stFormSubmitButton > button:hover {
+        border-color: #aeb8dc; color: var(--accent);
+    }
+    button[kind="primary"] { background: var(--accent); border-color: var(--accent); }
+    button[kind="primary"]:hover { background: #35488f; color: white; }
+    [data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea,
+    [data-testid="stSelectbox"] [role="combobox"] {
+        border-radius: 8px; border-color: var(--line);
+    }
+    [data-testid="stRadio"] label { color: var(--ink); }
+    [data-testid="stChatMessage"] {
+        border: 1px solid var(--line); border-radius: 12px;
+        background: var(--surface); padding: .75rem 1rem;
+    }
+    [data-testid="stChatInput"] textarea { border-radius: 12px; }
+    .brand-mark {
+        display: flex; align-items: center; gap: .7rem; margin: .2rem 0 1.8rem;
+        color: var(--ink); font-weight: 700; font-size: 1.12rem;
+    }
+    .brand-icon {
+        width: 30px; height: 30px; display: grid; place-items: center;
+        border-radius: 9px; background: var(--accent); color: white; font-size: .95rem;
+    }
+    .eyebrow { color: var(--muted); font-size: .74rem; font-weight: 650;
+        letter-spacing: .09em; text-transform: uppercase; }
+    .page-subtitle { color: var(--muted); margin-top: -.7rem; }
+    .pill { display: inline-block; padding: .22rem .55rem; border-radius: 999px;
+        font-size: .74rem; font-weight: 600; white-space: nowrap; }
+    .status-pending { color: #606b7a; background: #eef0f3; }
+    .status-in_progress { color: #755414; background: #fbf2dc; }
+    .status-completed { color: #287054; background: #e6f4ed; }
+    .priority-high { color: #a33f43; background: #fae9e9; }
+    .priority-medium { color: #755414; background: #fbf2dc; }
+    .priority-low { color: #606b7a; background: #eef0f3; }
+    .auth-wrap { max-width: 520px; margin: 5vh auto 0; }
+    @media (max-width: 760px) {
+        .block-container { padding: 1.2rem 1rem 3rem; }
+        h1 { font-size: 1.65rem; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-# -------------------------
-# Helpers
-# -------------------------
-
-
-def reset_page():
-    st.session_state.page = 0
-
-
-def api_request(method, endpoint, **kwargs):
-    headers = kwargs.pop("headers", {})
-    if st.session_state.get("access_token"):
-        headers["Authorization"] = f"Bearer {st.session_state.access_token}"
+def api_request(method: str, endpoint: str, **kwargs):
+    headers = dict(kwargs.pop("headers", {}))
     timeout = kwargs.pop("timeout", 30)
+    token = st.session_state.get("access_token")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     response = requests.request(
         method, f"{API_URL}{endpoint}", headers=headers, timeout=timeout, **kwargs
     )
+    if response.status_code == 401 and st.session_state.get("refresh_token"):
+        try:
+            refreshed = requests.post(
+                f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token",
+                headers={"apikey": SUPABASE_ANON_KEY},
+                json={"refresh_token": st.session_state.refresh_token},
+                timeout=15,
+            )
+            refreshed.raise_for_status()
+            session = refreshed.json()
+            st.session_state.access_token = session["access_token"]
+            st.session_state.refresh_token = session.get(
+                "refresh_token", st.session_state.refresh_token
+            )
+            headers["Authorization"] = f"Bearer {st.session_state.access_token}"
+            response = requests.request(
+                method,
+                f"{API_URL}{endpoint}",
+                headers=headers,
+                timeout=timeout,
+                **kwargs,
+            )
+        except (requests.RequestException, KeyError):
+            st.session_state.pop("access_token", None)
+            st.session_state.pop("refresh_token", None)
+            st.rerun()
     response.raise_for_status()
     return response
 
 
-if "page" not in st.session_state:
-    st.session_state.page = 0
+def save_session(session: dict) -> None:
+    st.session_state.access_token = session["access_token"]
+    st.session_state.refresh_token = session.get("refresh_token", "")
+    st.session_state.user_email = (session.get("user") or {}).get("email", "")
 
-if not st.session_state.get("access_token"):
-    st.title("TaskFlow sign in")
+
+def show_authentication() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container { max-width: 560px !important; padding-top: 6vh !important; }
+        [data-testid="stAppViewContainer"] { background: #f5f6f8 !important; }
+        [data-testid="stTextInput"] input {
+            background: #fff !important; color: #20242c !important;
+            border-color: #d9dde5 !important;
+        }
+        [data-testid="stTextInput"] input::placeholder { color: #737b88 !important; }
+        [data-testid="stBaseButton-primary"] {
+            background: #4257a5 !important; color: #fff !important;
+            border-color: #4257a5 !important;
+        }
+        [data-testid="stBaseButton-secondary"] {
+            background: #fff !important; color: #303642 !important;
+            border-color: #d9dde5 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="brand-mark"><span class="brand-icon">✓</span>TaskFlow</div>',
+        unsafe_allow_html=True,
+    )
+    st.title("A clearer way to manage your work")
+    st.markdown(
+        '<p class="page-subtitle">Sign in to organize tasks and work with your '
+        "AI assistant.</p>",
+        unsafe_allow_html=True,
+    )
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         st.error("Configure SUPABASE_URL and SUPABASE_ANON_KEY for the frontend.")
         st.stop()
-    auth_mode = st.radio("Account", ["Sign in", "Create account"], horizontal=True)
-    with st.form("auth_form"):
-        email = st.text_input("Email")
-        password = st.text_input("Password", type="password")
-        submit_auth = st.form_submit_button(auth_mode, type="primary")
-    if submit_auth:
-        auth_path = (
-            "/auth/v1/token?grant_type=password"
-            if auth_mode == "Sign in"
-            else "/auth/v1/signup"
-        )
+
+    callback_code = st.query_params.get("code")
+    callback_state = st.query_params.get("auth_state")
+    if st.query_params.get("error"):
+        st.error("Google sign-in was cancelled or could not be completed.")
+        st.query_params.clear()
+    if callback_code and callback_state:
         try:
-            auth_response = requests.post(
-                f"{SUPABASE_URL}{auth_path}",
-                headers={
-                    "apikey": SUPABASE_ANON_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={"email": email.strip(), "password": password},
-                timeout=15,
+            response = requests.post(
+                f"{API_URL}/auth/google/exchange",
+                json={"code": callback_code, "state": callback_state},
+                timeout=20,
             )
-            auth_response.raise_for_status()
-            auth_data = auth_response.json()
-            if not auth_data.get("access_token"):
-                st.success("Check your email to confirm your account, then sign in.")
-            else:
-                st.session_state.access_token = auth_data["access_token"]
-                st.rerun()
-        except requests.RequestException as error:
-            error_code = None
-            if error.response is not None:
-                try:
-                    error_code = error.response.json().get("error_code")
-                except ValueError:
-                    pass
-            if error_code == "invalid_credentials":
-                st.error(
-                    "Supabase did not accept that email and password. If this is a "
-                    "new account, choose Create account and confirm the email before "
-                    "signing in. Otherwise, check the email address and password."
-                )
-            elif error_code == "email_not_confirmed":
-                st.error(
-                    "Confirm your account using the link sent to your email, "
-                    "then sign in."
-                )
-            elif error_code == "over_email_send_rate_limit":
-                st.error(
-                    "Supabase temporarily blocked signup email delivery because "
-                    "the project's email quota was reached. Stop retrying for now "
-                    "and check your inbox and spam folder for the first confirmation "
-                    "email. If none arrived, wait for the quota window to reset, then "
-                    "try Create account once. For ongoing use, configure custom SMTP "
-                    "in Supabase Auth."
-                )
-            else:
-                detail = (
-                    error.response.text
-                    if error.response is not None
-                    else str(error)
-                )
-                st.error(f"Authentication failed: {detail}")
-    st.stop()
-
-if st.sidebar.button("Sign out"):
-    try:
-        requests.post(
-            f"{SUPABASE_URL}/auth/v1/logout",
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Authorization": f"Bearer {st.session_state.access_token}",
-            },
-            timeout=10,
-        )
-    except requests.RequestException:
-        pass
-    st.session_state.pop("access_token", None)
-    st.session_state.pop("conversation_id", None)
-    st.session_state.pop("selected_conversation_id", None)
-    st.rerun()
-
-
-# -------------------------
-# Header
-# -------------------------
-
-st.title("TaskFlow")
-
-st.markdown(
-    '<p class="subtitle">Organize your work. Focus on what matters.</p>',
-    unsafe_allow_html=True,
-)
-
-
-# -------------------------
-# Create task
-# -------------------------
-
-with st.expander("＋ Create a new task"):
-    with st.form("create_task_form", clear_on_submit=True):
-        title = st.text_input("Task title")
-        description = st.text_area("Description")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            priority = st.selectbox("Priority", ["medium", "high", "low"])
-
-        with col2:
-            due_date = st.date_input("Due date", value=None, format="YYYY-MM-DD")
-
-        submitted = st.form_submit_button(
-            "Create task", type="primary", use_container_width=True
-        )
-
-        if submitted:
-            if not title.strip():
-                st.warning("Please enter a task title.")
-
-            else:
-                try:
-                    api_request(
-                        "POST",
-                        "/tasks",
-                        json={
-                            "title": title.strip(),
-                            "description": description,
-                            "priority": priority,
-                            "due_date": (due_date.isoformat() if due_date else None),
-                        },
-                    )
-
-                    st.success("Task created!")
-                    reset_page()
-                    st.rerun()
-
-                except requests.RequestException as error:
-                    st.error(f"Could not create task: {error}")
-
-
-st.divider()
-
-
-# -------------------------
-# Filters
-# -------------------------
-
-st.subheader("Your tasks")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    status_filter = st.selectbox(
-        "Status",
-        ["All", "pending", "in_progress", "completed"],
-        key="status_filter",
-        on_change=reset_page,
-    )
-
-with col2:
-    priority_filter = st.selectbox(
-        "Priority",
-        ["All", "high", "medium", "low"],
-        key="priority_filter",
-        on_change=reset_page,
-    )
-
-with col3:
-    sort_by = st.selectbox(
-        "Sort by", ["id", "priority"], key="sort_by", on_change=reset_page
-    )
-
-
-# -------------------------
-# Fetch tasks
-# -------------------------
-
-params = {
-    "sort_by": sort_by,
-    "skip": st.session_state.page * PAGE_SIZE,
-    "limit": PAGE_SIZE + 1,
-}
-
-if status_filter != "All":
-    params["status_filter"] = status_filter
-
-if priority_filter != "All":
-    params["priority"] = priority_filter
-
-
-try:
-    response = api_request("GET", "/tasks", params=params)
-
-    tasks = response.json()
-
-    has_next = len(tasks) > PAGE_SIZE
-    tasks = tasks[:PAGE_SIZE]
-
-    if not tasks:
-        st.info("No tasks found. Create a task or change your filters.")
-
-    else:
-        # -------------------------
-        # Compact task cards
-        # -------------------------
-
-        for task in tasks:
-            with st.container(border=True):
-                col1, col2 = st.columns([10, 2])
-
-                with col1:
-                    # Title
-                    st.write(task["title"])
-
-                    # Compact metadata
-                    st.caption(
-                        f"{task['status'].replace('_', ' ').title()}"
-                        f"  ·  {task['priority'].title()}"
-                        f"  ·  Due: {task['due_date'] or 'Not set'}"
-                    )
-
-                with col2:
-                    st.markdown(
-                        f'<div style="text-align:right; color:#808495;'
-                        f'font-size:12px;">'
-                        f"{task['status'].replace('_', ' ').title()}"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                # -------------------------
-                # Expandable task details
-                # -------------------------
-
-                with st.expander("View details and edit"):
-                    st.markdown("**Description**")
-
-                    st.write(
-                        task["description"]
-                        if task["description"]
-                        else "No description provided."
-                    )
-
-                    st.divider()
-
-                    st.markdown("**Task information**")
-
-                    st.caption(f"Created: {task['created_at']}")
-
-                    st.caption(f"Last updated: {task['updated_at']}")
-
-                    # -------------------------
-                    # Edit task
-                    # -------------------------
-
-                    st.markdown("**Edit task**")
-
-                    task_due_date = (
-                        date.fromisoformat(task["due_date"])
-                        if task["due_date"]
-                        else None
-                    )
-
-                    with st.form(f"update_form_{task['id']}"):
-                        new_title = st.text_input(
-                            "Title", value=task["title"], key=f"title_{task['id']}"
-                        )
-
-                        new_description = st.text_area(
-                            "Description",
-                            value=task["description"] or "",
-                            key=f"description_{task['id']}",
-                        )
-
-                        col1, col2 = st.columns(2)
-
-                        with col1:
-                            new_status = st.selectbox(
-                                "Status",
-                                ["pending", "in_progress", "completed"],
-                                index=["pending", "in_progress", "completed"].index(
-                                    task["status"]
-                                ),
-                                key=f"status_{task['id']}",
-                            )
-
-                        with col2:
-                            new_priority = st.selectbox(
-                                "Priority",
-                                ["low", "medium", "high"],
-                                index=["low", "medium", "high"].index(task["priority"]),
-                                key=f"priority_{task['id']}",
-                            )
-
-                        new_due_date = st.date_input(
-                            "Due date",
-                            value=task_due_date,
-                            format="YYYY-MM-DD",
-                            key=f"due_date_{task['id']}",
-                        )
-
-                        save = st.form_submit_button(
-                            "Save changes", type="primary", use_container_width=True
-                        )
-
-                        if save:
-                            if not new_title.strip():
-                                st.warning("Task title cannot be empty.")
-
-                            else:
-                                try:
-                                    api_request(
-                                        "PUT",
-                                        f"/tasks/{task['id']}",
-                                        json={
-                                            "title": new_title.strip(),
-                                            "description": new_description,
-                                            "status": new_status,
-                                            "priority": new_priority,
-                                            "due_date": (
-                                                new_due_date.isoformat()
-                                                if new_due_date
-                                                else None
-                                            ),
-                                        },
-                                    )
-
-                                    st.success("Task updated!")
-                                    st.rerun()
-
-                                except requests.RequestException as error:
-                                    st.error(f"Could not update task: {error}")
-
-                    # -------------------------
-                    # Delete task
-                    # -------------------------
-
-                    st.divider()
-
-                    confirm_delete = st.checkbox(
-                        "I want to delete this task", key=f"confirm_delete_{task['id']}"
-                    )
-
-                    if st.button(
-                        "Delete task",
-                        key=f"delete_{task['id']}",
-                        disabled=not confirm_delete,
-                        use_container_width=True,
-                    ):
-                        try:
-                            api_request("DELETE", f"/tasks/{task['id']}")
-
-                            st.success("Task deleted!")
-                            st.rerun()
-
-                        except requests.RequestException as error:
-                            st.error(f"Could not delete task: {error}")
-
-    # -------------------------
-    # Pagination
-    # -------------------------
-
-    st.divider()
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-
-    with col1:
-        if st.button(
-            "← Previous", disabled=st.session_state.page == 0, use_container_width=True
-        ):
-            st.session_state.page -= 1
+            response.raise_for_status()
+            save_session(response.json())
+            st.query_params.clear()
             st.rerun()
+        except requests.RequestException as error:
+            st.error(f"Google sign-in could not be completed: {error}")
 
-    with col2:
+    with st.container(border=True):
+        auth_mode = st.radio("Account", ["Sign in", "Create account"], horizontal=True)
+        with st.form("auth_form"):
+            email = st.text_input("Email address", placeholder="you@example.com")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button(
+                auth_mode, type="primary", use_container_width=True
+            )
+        if submit:
+            endpoint = (
+                "/auth/v1/token?grant_type=password"
+                if auth_mode == "Sign in"
+                else "/auth/v1/signup"
+            )
+            try:
+                response = requests.post(
+                    f"{SUPABASE_URL}{endpoint}",
+                    headers={
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    json={"email": email.strip(), "password": password},
+                    timeout=15,
+                )
+                response.raise_for_status()
+                session = response.json()
+                if not session.get("access_token"):
+                    st.success(
+                        "Check your email to confirm your account, then sign in."
+                    )
+                else:
+                    save_session(session)
+                    st.rerun()
+            except requests.RequestException as error:
+                code = None
+                if error.response is not None:
+                    try:
+                        code = error.response.json().get("error_code")
+                    except ValueError:
+                        pass
+                messages = {
+                    "invalid_credentials": "Email or password was not accepted.",
+                    "email_not_confirmed": (
+                        "Confirm your account using the email link, then sign in."
+                    ),
+                    "over_email_send_rate_limit": (
+                        "Supabase email delivery is rate-limited. "
+                        "Check your inbox or try again later."
+                    ),
+                }
+                st.error(messages.get(code, f"Authentication failed: {error}"))
+
+        st.divider()
+        if st.button("Continue with Google", use_container_width=True):
+            try:
+                response = requests.post(f"{API_URL}/auth/google/start", timeout=10)
+                response.raise_for_status()
+                st.link_button("Open Google sign-in", response.json()["url"])
+            except requests.RequestException:
+                st.info("Google sign-in is not enabled for this TaskFlow instance.")
+
+
+def fetch_tasks() -> list[dict]:
+    tasks = []
+    for offset in range(0, 10_000, PAGE_SIZE):
+        page = api_request(
+            "GET",
+            "/tasks",
+            params={"sort_by": "id", "skip": offset, "limit": PAGE_SIZE},
+        ).json()
+        tasks.extend(page)
+        if len(page) < PAGE_SIZE:
+            break
+    return tasks
+
+
+def status_pill(status: str) -> str:
+    label = STATUSES.get(status, status.replace("_", " ").title())
+    return f'<span class="pill status-{status}">{label}</span>'
+
+
+def priority_pill(priority: str) -> str:
+    label = priority.title()
+    return f'<span class="pill priority-{priority}">{label} priority</span>'
+
+
+def due_label(value: str | None) -> str:
+    if not value:
+        return "No due date"
+    parsed = date.fromisoformat(value)
+    if parsed < date.today():
+        return f"Overdue · {parsed.strftime('%b')} {parsed.day}"
+    return f"Due {parsed.strftime('%b')} {parsed.day}"
+
+
+def render_task_row(task: dict, *, compact: bool = False) -> None:
+    with st.container(border=True):
+        columns = st.columns([5, 2, 2] if compact else [4.5, 2, 2, 1.5])
+        with columns[0]:
+            st.markdown(f"**{task['title']}**")
+            if task.get("description"):
+                st.caption(task["description"])
+            else:
+                st.caption("No description")
+        with columns[1]:
+            st.markdown(status_pill(task["status"]), unsafe_allow_html=True)
+        with columns[2]:
+            st.markdown(priority_pill(task["priority"]), unsafe_allow_html=True)
+        if not compact:
+            with columns[3]:
+                st.caption(due_label(task.get("due_date")))
+
+
+def create_task_form(key: str = "create_task") -> None:
+    with st.expander("＋  Add a task", expanded=False):
+        with st.form(key, clear_on_submit=True):
+            title = st.text_input("Task name", max_chars=200)
+            description = st.text_area("Description", height=90)
+            left, middle, right = st.columns(3)
+            with left:
+                priority = st.selectbox("Priority", ["medium", "high", "low"])
+            with middle:
+                due_date = st.date_input("Due date", value=None, format="YYYY-MM-DD")
+            with right:
+                st.write("")
+                st.write("")
+                submit = st.form_submit_button("Create task", type="primary")
+            if submit:
+                if not title.strip():
+                    st.warning("Add a task name to continue.")
+                else:
+                    try:
+                        api_request(
+                            "POST",
+                            "/tasks",
+                            json={
+                                "title": title.strip(),
+                                "description": description.strip() or None,
+                                "priority": priority,
+                                "due_date": due_date.isoformat() if due_date else None,
+                            },
+                        )
+                        st.toast("Task created")
+                        st.rerun()
+                    except requests.RequestException as error:
+                        st.error(f"Could not create task: {error}")
+
+
+def render_task_editor(task: dict) -> None:
+    with st.expander("Edit details"):
+        due_value = (
+            date.fromisoformat(task["due_date"]) if task.get("due_date") else None
+        )
+        with st.form(f"edit_{task['id']}"):
+            title = st.text_input("Task name", value=task["title"], max_chars=200)
+            description = st.text_area(
+                "Description", value=task.get("description") or "", height=85
+            )
+            left, middle, right = st.columns(3)
+            with left:
+                status = st.selectbox(
+                    "Status",
+                    list(STATUSES),
+                    index=list(STATUSES).index(task["status"]),
+                    format_func=lambda value: STATUSES[value],
+                )
+            with middle:
+                priority = st.selectbox(
+                    "Priority",
+                    ["high", "medium", "low"],
+                    index=["high", "medium", "low"].index(task["priority"]),
+                )
+            with right:
+                due_date = st.date_input(
+                    "Due date", value=due_value, format="YYYY-MM-DD"
+                )
+            save = st.form_submit_button("Save changes", type="primary")
+            if save:
+                if not title.strip():
+                    st.warning("Task name cannot be empty.")
+                else:
+                    try:
+                        api_request(
+                            "PUT",
+                            f"/tasks/{task['id']}",
+                            json={
+                                "title": title.strip(),
+                                "description": description.strip() or None,
+                                "status": status,
+                                "priority": priority,
+                                "due_date": due_date.isoformat() if due_date else None,
+                            },
+                        )
+                        st.toast("Changes saved")
+                        st.rerun()
+                    except requests.RequestException as error:
+                        st.error(f"Could not update task: {error}")
+
+
+def render_dashboard(tasks: list[dict]) -> None:
+    email = st.session_state.get("user_email", "")
+    name = (
+        email.split("@", maxsplit=1)[0].replace(".", " ").title() if email else "there"
+    )
+    st.markdown('<p class="eyebrow">Overview</p>', unsafe_allow_html=True)
+    st.title(f"Welcome back, {name}")
+    st.markdown(
+        '<p class="page-subtitle">A calm place to see what is moving and what '
+        "needs your attention.</p>",
+        unsafe_allow_html=True,
+    )
+
+    today = date.today()
+    completed = sum(task["status"] == "completed" for task in tasks)
+    pending = sum(task["status"] == "pending" for task in tasks)
+    overdue = sum(
+        1
+        for task in tasks
+        if task.get("due_date")
+        and date.fromisoformat(task["due_date"]) < today
+        and task["status"] != "completed"
+    )
+    metrics = st.columns(4)
+    for column, label, value in zip(
+        metrics,
+        ("All tasks", "To do", "Completed", "Overdue"),
+        (len(tasks), pending, completed, overdue),
+    ):
+        with column:
+            st.metric(label, value)
+
+    if tasks:
+        progress = completed / len(tasks)
+        st.write("")
+        st.markdown("**Completion**")
+        st.progress(progress, text=f"{completed} of {len(tasks)} tasks complete")
+
+    st.write("")
+    left, right = st.columns([1.35, 1])
+    with left:
+        st.subheader("Recently updated")
+        recent = sorted(
+            tasks, key=lambda task: task.get("updated_at") or "", reverse=True
+        )[:5]
+        if recent:
+            for task in recent:
+                render_task_row(task, compact=True)
+        else:
+            with st.container(border=True):
+                st.markdown("**Your workspace is ready**")
+                st.caption("Create a task to give your day a starting point.")
+                if st.button("Go to My Tasks", type="primary"):
+                    st.session_state.page = "My Tasks"
+                    st.rerun()
+    with right:
+        st.subheader("Upcoming deadlines")
+        upcoming = sorted(
+            [
+                task
+                for task in tasks
+                if task.get("due_date")
+                and date.fromisoformat(task["due_date"]) >= today
+                and task["status"] != "completed"
+            ],
+            key=lambda task: task["due_date"],
+        )[:5]
+        if upcoming:
+            for task in upcoming:
+                with st.container(border=True):
+                    st.markdown(f"**{task['title']}**")
+                due_date = date.fromisoformat(task["due_date"])
+                st.caption(f"{due_date.strftime('%A, %b')} {due_date.day}")
+        else:
+            with st.container(border=True):
+                st.markdown("**No upcoming deadlines**")
+                st.caption("Tasks with due dates will appear here.")
+
+
+def render_tasks(tasks: list[dict]) -> None:
+    st.markdown('<p class="eyebrow">Workspace</p>', unsafe_allow_html=True)
+    st.title("My tasks")
+    st.markdown(
+        '<p class="page-subtitle">Capture the work, set a priority, and keep '
+        "things moving.</p>",
+        unsafe_allow_html=True,
+    )
+    create_task_form()
+
+    search_col, status_col, priority_col, sort_col = st.columns([2.4, 1.2, 1.2, 1.2])
+    with search_col:
+        query = st.text_input(
+            "Search", placeholder="Find a task…", label_visibility="collapsed"
+        )
+    with status_col:
+        status_filter = st.selectbox(
+            "Status",
+            ["All statuses", *STATUSES],
+            format_func=lambda value: (
+                "Status" if value == "All statuses" else STATUSES[value]
+            ),
+        )
+    with priority_col:
+        priority_filter = st.selectbox(
+            "Priority",
+            ["All priorities", "high", "medium", "low"],
+            format_func=lambda value: (
+                "Priority" if value == "All priorities" else value.title()
+            ),
+        )
+    with sort_col:
+        sort_by = st.selectbox("Sort", ["Recently updated", "Due date", "Priority"])
+
+    visible = tasks
+    if query.strip():
+        needle = query.casefold().strip()
+        visible = [
+            task
+            for task in visible
+            if needle in task["title"].casefold()
+            or needle in (task.get("description") or "").casefold()
+        ]
+    if status_filter != "All statuses":
+        visible = [task for task in visible if task["status"] == status_filter]
+    if priority_filter != "All priorities":
+        visible = [task for task in visible if task["priority"] == priority_filter]
+    if sort_by == "Due date":
+        visible = sorted(visible, key=lambda task: task.get("due_date") or "9999-12-31")
+    elif sort_by == "Priority":
+        visible = sorted(
+            visible, key=lambda task: ["high", "medium", "low"].index(task["priority"])
+        )
+    else:
+        visible = sorted(
+            visible, key=lambda task: task.get("updated_at") or "", reverse=True
+        )
+
+    st.caption(f"{len(visible)} {('task' if len(visible) == 1 else 'tasks')}")
+    if not visible:
+        with st.container(border=True):
+            st.markdown("**Nothing matches this view**")
+            st.caption("Try a different search or filter, or add a new task above.")
+        return
+
+    for task in visible:
+        with st.container(border=True):
+            heading, actions = st.columns([5, 1.4])
+            with heading:
+                st.markdown(f"**{task['title']}**")
+                if task.get("description"):
+                    st.caption(task["description"])
+                badges = (
+                    f"{status_pill(task['status'])} &nbsp; "
+                    f"{priority_pill(task['priority'])} &nbsp; "
+                    f"<span class='pill'>{due_label(task.get('due_date'))}</span>"
+                )
+                st.markdown(badges, unsafe_allow_html=True)
+            with actions:
+                complete = task["status"] != "completed"
+                label = "Mark complete" if complete else "Reopen"
+                if st.button(
+                    label, key=f"toggle_{task['id']}", use_container_width=True
+                ):
+                    next_status = "completed" if complete else "pending"
+                    try:
+                        api_request(
+                            "PUT", f"/tasks/{task['id']}", json={"status": next_status}
+                        )
+                        st.rerun()
+                    except requests.RequestException as error:
+                        st.error(f"Could not update task: {error}")
+            render_task_editor(task)
+            with st.expander("More actions"):
+                confirm = st.checkbox("Confirm deletion", key=f"confirm_{task['id']}")
+                if st.button(
+                    "Delete task", key=f"delete_{task['id']}", disabled=not confirm
+                ):
+                    try:
+                        api_request("DELETE", f"/tasks/{task['id']}")
+                        st.toast("Task deleted")
+                        st.rerun()
+                    except requests.RequestException as error:
+                        st.error(f"Could not delete task: {error}")
+
+
+def load_conversations() -> list[dict]:
+    return api_request("GET", "/chat/conversations").json()
+
+
+def render_assistant() -> None:
+    st.markdown('<p class="eyebrow">AI assistant</p>', unsafe_allow_html=True)
+    title_col, new_col = st.columns([5, 1])
+    with title_col:
+        st.title("Ask TaskFlow")
         st.markdown(
-            f"<p style='text-align:center; padding-top:5px;'>"
-            f"Page {st.session_state.page + 1}</p>",
+            '<p class="page-subtitle">Plan, find, and update your tasks in a '
+            "conversation.</p>",
             unsafe_allow_html=True,
         )
-
-    with col3:
-        if st.button("Next →", disabled=not has_next, use_container_width=True):
-            st.session_state.page += 1
+    with new_col:
+        if st.button("＋ New chat", use_container_width=True):
+            st.session_state.active_conversation_id = None
+            st.session_state.chat_history = []
             st.rerun()
 
+    try:
+        conversations = load_conversations()
+    except requests.RequestException as error:
+        st.error(f"Could not load conversations: {error}")
+        conversations = []
 
-except requests.RequestException as error:
-    st.error(
-        "Unable to connect to TaskFlow backend. "
-        "Make sure FastAPI is running. "
-        f"Details: {error}"
-    )
+    conversation_by_id = {item["id"]: item for item in conversations}
+    options = [None, *conversation_by_id]
+    current = st.session_state.get("active_conversation_id")
+    if current not in options:
+        current = None
+        st.session_state.active_conversation_id = None
 
-
-# -------------------------
-# AI Assistant
-# -------------------------
-
-st.divider()
-
-st.subheader("TaskFlow AI Assistant")
-
-# Initialize session state
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-if "conversation_id" not in st.session_state:
-    st.session_state.conversation_id = None
-
-if "selected_conversation_id" not in st.session_state:
-    st.session_state.selected_conversation_id = None
-
-
-# -------------------------
-# Conversation Sidebar
-# -------------------------
-
-response = api_request("GET", "/chat/conversations")
-conversations = response.json()
-
-if st.sidebar.button("New Chat"):
-    st.session_state.conversation_id = None
-    st.session_state.selected_conversation_id = None
-    st.session_state.chat_history = []
-    st.rerun()
-
-conversation_options = [None] + [conversation["id"] for conversation in conversations]
-
-selected_id = st.sidebar.selectbox(
-    "Previous Conversations",
-    options=conversation_options,
-    format_func=lambda conversation_id: (
-        "New conversation"
-        if conversation_id is None
-        else f"Conversation {conversation_id}"
-    ),
-    key="selected_conversation_id",
-)
-
-
-# Load selected conversation when selection changes
-if selected_id != st.session_state.conversation_id:
-    if selected_id is None:
-        st.session_state.conversation_id = None
-        st.session_state.chat_history = []
-
-    else:
-        response = api_request(
-            "GET",
-            f"/chat/conversations/{selected_id}",
+    if conversations:
+        if st.session_state.get("conversation_picker") != current:
+            st.session_state.conversation_picker = current
+        selected = st.selectbox(
+            "Conversation history",
+            options,
+            index=options.index(current),
+            format_func=lambda item_id: (
+                "New conversation"
+                if item_id is None
+                else conversation_by_id[item_id].get("title")
+                or f"Conversation {item_id}"
+            ),
+            key="conversation_picker",
         )
+        if selected != st.session_state.get("active_conversation_id"):
+            st.session_state.active_conversation_id = selected
+            if selected is None:
+                st.session_state.chat_history = []
+            else:
+                try:
+                    detail = api_request(
+                        "GET", f"/chat/conversations/{selected}"
+                    ).json()
+                    st.session_state.chat_history = detail["messages"]
+                except requests.RequestException as error:
+                    st.error(f"Could not load this conversation: {error}")
+                    st.session_state.chat_history = []
 
-        conversation = response.json()
-
-        st.session_state.conversation_id = conversation["id"]
-        st.session_state.chat_history = conversation["messages"]
-
-
-# -------------------------
-# Display Previous Messages
-# -------------------------
-
-for message in st.session_state.chat_history:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
-
-
-# -------------------------
-# Receive a New Message
-# -------------------------
-
-if prompt := st.chat_input("Ask TaskFlow something..."):
-    # Display and save user message
-    st.session_state.chat_history.append(
-        {
-            "role": "user",
-            "content": prompt,
-        }
-    )
-
-    with st.chat_message("user"):
-        st.write(prompt)
-
-    # Prepare request with conversation ID
-    payload = {
-        "message": prompt,
-        "conversation_id": st.session_state.conversation_id,
-    }
-
-    # Ask the backend
-    with st.chat_message("assistant"), st.spinner("Thinking..."):
-        try:
-            response = api_request(
-                "POST",
-                "/chat/",
-                timeout=300,
-                json=payload,
+    history = st.session_state.get("chat_history", [])
+    if not history:
+        with st.container(border=True):
+            st.markdown("**Your assistant is ready when you are**")
+            st.caption(
+                "Ask about your tasks, or ask TaskFlow to create, update, "
+                "complete, or find one."
             )
+            st.write("Try: *What should I work on next?*")
 
-            result = response.json()
+    for message in history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-            # Store the conversation ID returned by the backend
-            st.session_state.conversation_id = result["conversation_id"]
+    prompt = st.chat_input("Message TaskFlow…")
+    if prompt:
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"), st.spinner("Working through your request…"):
+            try:
+                result = api_request(
+                    "POST",
+                    "/chat/",
+                    timeout=300,
+                    json={
+                        "message": prompt,
+                        "conversation_id": st.session_state.get(
+                            "active_conversation_id"
+                        ),
+                    },
+                ).json()
+                st.session_state.active_conversation_id = result["conversation_id"]
+                st.markdown(result["answer"])
+                st.session_state.chat_history.append(
+                    {"role": "assistant", "content": result["answer"]}
+                )
+            except requests.HTTPError as error:
+                detail = (
+                    error.response.text if error.response is not None else str(error)
+                )
+                st.error(f"The backend could not answer this request: {detail}")
+            except requests.RequestException as error:
+                st.error(f"Could not connect to the AI assistant: {error}")
+        st.rerun()
 
-            answer = result["answer"]
 
-            st.write(answer)
+def main() -> None:
+    if not st.session_state.get("access_token"):
+        show_authentication()
+        return
 
-            st.session_state.chat_history.append(
-                {
-                    "role": "assistant",
-                    "content": answer,
-                }
-            )
+    with st.sidebar:
+        st.markdown(
+            '<div class="brand-mark"><span class="brand-icon">✓</span>TaskFlow</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('<p class="eyebrow">Workspace</p>', unsafe_allow_html=True)
+        page = st.radio(
+            "Navigate",
+            ["Dashboard", "My Tasks", "AI Assistant"],
+            label_visibility="collapsed",
+            key="page",
+        )
+        st.sidebar.divider()
+        email = st.session_state.get("user_email")
+        if email:
+            st.caption(email)
+        if st.button("Sign out", use_container_width=True):
+            try:
+                requests.post(
+                    f"{SUPABASE_URL}/auth/v1/logout",
+                    headers={
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Authorization": f"Bearer {st.session_state.access_token}",
+                    },
+                    timeout=10,
+                )
+            except requests.RequestException:
+                pass
+            for key in (
+                "access_token",
+                "refresh_token",
+                "user_email",
+                "active_conversation_id",
+                "chat_history",
+            ):
+                st.session_state.pop(key, None)
+            st.rerun()
 
-        except requests.HTTPError as error:
-            st.error(f"Backend returned an error: {error.response.text}")
+    try:
+        tasks = fetch_tasks()
+    except requests.RequestException as error:
+        st.title("TaskFlow")
+        st.error(
+            "The TaskFlow API could not be reached. Check that FastAPI is running. "
+            f"Details: {error}"
+        )
+        return
 
-        except requests.RequestException as error:
-            st.error(f"Could not connect to the AI backend: {error}")
+    if page == "Dashboard":
+        render_dashboard(tasks)
+    elif page == "My Tasks":
+        render_tasks(tasks)
+    else:
+        render_assistant()
 
-    st.rerun()
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,15 @@
 from datetime import UTC, date, datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import JSON, Date, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import (
+    JSON,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -98,4 +106,14 @@ class TaskEmbedding(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(
         Vector(768).with_variant(JSON(), "sqlite"), nullable=False
+    )
+
+
+class OAuthState(Base):
+    __tablename__ = "oauth_states"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code_verifier: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
     )

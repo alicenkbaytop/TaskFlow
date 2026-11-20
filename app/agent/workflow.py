@@ -6,15 +6,15 @@ from langgraph.graph import END, START, StateGraph
 from opentelemetry import trace
 
 from app.agent.state import AgentState
+from app.core.config import get_settings
 from app.database import SessionLocal
 from app.services.llm_service import (
-    AI_PROVIDER,
-    MODEL_NAME,
     execute_tool,
-    generate_gemini_message,
-    get_llm_client,
+    generate_chat_message,
     tools,
 )
+from app.services.model_router import fallback_route, resolve_route
+from app.services.provider_reliability import is_retryable_provider_error, with_retries
 
 logger = logging.getLogger(__name__)
 
@@ -29,39 +29,44 @@ MAX_TOOL_ROUNDS = 5
 
 
 def agent_node(state: AgentState):
-
     start_time = time.perf_counter()
+    settings = get_settings()
+    route = resolve_route("chat")
+    retry_count = 0
+    assistant_message = None
 
     with tracer.start_as_current_span("agent.llm_request") as span:
-        span.set_attribute("llm.model", MODEL_NAME)
+        span.set_attribute("llm.provider", route.provider)
+        span.set_attribute("llm.model", route.model)
 
         try:
-            if AI_PROVIDER == "gemini":
-                assistant_message = generate_gemini_message(
-                    state["messages"], tools
+            try:
+                assistant_message, retry_count = with_retries(
+                    lambda: generate_chat_message(route, state["messages"], tools),
+                    attempts=settings.ai_retry_attempts,
+                    base_delay_seconds=settings.ai_retry_base_seconds,
                 )
-            else:
-                response = get_llm_client().chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=state["messages"],
-                    tools=tools,
+            except Exception as primary_error:
+                next_route = fallback_route(route)
+                if not next_route or not is_retryable_provider_error(primary_error):
+                    raise
+                logger.warning(
+                    "Primary route failed; trying fallback provider=%s model=%s",
+                    next_route.provider,
+                    next_route.model,
                 )
-                choice = response.choices[0].message
-                assistant_message = {
-                    "content": choice.content or "",
-                    "tool_calls": [
-                        {
-                            "id": call.id,
-                            "type": "function",
-                            "function": {
-                                "name": call.function.name,
-                                "arguments": call.function.arguments,
-                            },
-                        }
-                        for call in (choice.tool_calls or [])
-                    ],
-                }
+                route = next_route
+                assistant_message, retry_count = with_retries(
+                    lambda: generate_chat_message(route, state["messages"], tools),
+                    attempts=settings.ai_retry_attempts,
+                    base_delay_seconds=settings.ai_retry_base_seconds,
+                )
+
+            duration = (time.perf_counter() - start_time) * 1000
             span.set_attribute("llm.success", True)
+            span.set_attribute("llm.provider", route.provider)
+            span.set_attribute("llm.model", route.model)
+            span.set_attribute("llm.retry_count", retry_count - 1)
 
         except Exception as error:
             span.set_attribute("llm.success", False)
@@ -71,17 +76,16 @@ def agent_node(state: AgentState):
             )
             logger.error(
                 "AI request failed: provider=%s model=%s type=%s status=%s",
-                AI_PROVIDER,
-                MODEL_NAME,
+                route.provider,
+                route.model,
                 type(error).__name__,
                 status_code,
             )
-
             error_type = type(error).__name__
             if error_type == "AuthenticationError" or status_code in (401, 403):
-                answer = f"The {AI_PROVIDER} provider rejected its credentials."
+                answer = f"The {route.provider} provider rejected its credentials."
             elif error_type == "RateLimitError" or status_code == 429:
-                answer = f"The {AI_PROVIDER} provider rate limit was reached."
+                answer = f"The {route.provider} provider rate limit was reached."
             elif "Timeout" in error_type or status_code == 504:
                 answer = "The AI provider did not respond in time. Please try again."
             elif error_type == "APIConnectionError":
@@ -91,7 +95,7 @@ def agent_node(state: AgentState):
                 )
             elif status_code == 404:
                 answer = (
-                    f"AI model '{MODEL_NAME}' is unavailable. "
+                    f"AI model '{route.model}' is unavailable. "
                     "Check the selected provider and model setting."
                 )
             elif status_code == 503:
@@ -110,12 +114,10 @@ def agent_node(state: AgentState):
                 )
             return {"answer": answer}
 
-    duration = (time.perf_counter() - start_time) * 1000
-
     logger.info(
         "AI provider: %s | model: %s | Duration: %.2f ms",
-        AI_PROVIDER,
-        MODEL_NAME,
+        route.provider,
+        route.model,
         duration,
     )
 
