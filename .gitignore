@@ -12,7 +12,7 @@ wheels/
 .venv/
 
 
-taskflow.db
+*.db
 qdrant_data/
 
 .pytest_cache/

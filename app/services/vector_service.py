@@ -1,94 +1,95 @@
-import requests
-from qdrant_client import QdrantClient, models
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-OLLAMA_URL = "http://localhost:11434/api/embed"
-EMBEDDING_MODEL = "nomic-embed-text"
+from app.core.config import get_settings
+from app.models import TaskEmbedding
 
-COLLECTION_NAME = "tasks"
-VECTOR_SIZE = 768
+EMBEDDING_DIMENSIONS = 768
 
-# Persistent local Qdrant storage
-client = QdrantClient(path="./qdrant_data")
+
+def embedding_provider_configured() -> bool:
+    settings = get_settings()
+    provider = settings.ai_provider.strip().lower()
+    return provider == "ollama" or (
+        provider == "gemini" and bool(settings.gemini_api_key)
+    )
 
 
 def create_embedding(text: str) -> list[float]:
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": EMBEDDING_MODEL,
-            "input": text,
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
+    settings = get_settings()
+    if settings.ai_provider.strip().lower() == "ollama":
+        from openai import OpenAI
 
-    return response.json()["embeddings"][0]
+        client = OpenAI(
+            api_key="ollama",
+            base_url=f"{settings.ollama_base_url.rstrip('/')}/",
+            timeout=120,
+            max_retries=0,
+        )
+        result = client.embeddings.create(
+            model=settings.ollama_embedding_model,
+            input=text,
+        )
+        vector = result.data[0].embedding
+    else:
+        if not settings.gemini_api_key:
+            raise RuntimeError("GEMINI_API_KEY is not configured")
+        from google import genai
+        from google.genai import types
 
-
-def ensure_collection():
-    if not client.collection_exists(COLLECTION_NAME):
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=models.VectorParams(
-                size=VECTOR_SIZE,
-                distance=models.Distance.COSINE,
+        client = genai.Client(api_key=settings.gemini_api_key)
+        result = client.models.embed_content(
+            model=settings.gemini_embedding_model,
+            contents=text,
+            config=types.EmbedContentConfig(
+                output_dimensionality=EMBEDDING_DIMENSIONS
             ),
         )
-
-
-def index_task(task_id: int, title: str, description: str | None):
-    ensure_collection()
-
-    text = f"Title: {title}\nDescription: {description or ''}"
-    vector = create_embedding(text)
-
-    client.upsert(
-        collection_name=COLLECTION_NAME,
-        points=[
-            models.PointStruct(
-                id=task_id,
-                vector=vector,
-                payload={
-                    "task_id": task_id,
-                    "title": title,
-                    "description": description,
-                },
-            )
-        ],
-    )
-
-
-def delete_task_vector(task_id: int):
-    if client.collection_exists(COLLECTION_NAME):
-        client.delete(
-            collection_name=COLLECTION_NAME,
-            points_selector=models.PointIdsList(points=[task_id]),
+        vector = result.embeddings[0].values
+    if len(vector) != EMBEDDING_DIMENSIONS:
+        raise ValueError(
+            f"Embedding provider returned {len(vector)} dimensions; "
+            f"expected {EMBEDDING_DIMENSIONS}"
         )
+    return list(vector)
 
 
-def search_similar_tasks(
-    query: str,
-    limit: int = 5,
-    score_threshold: float = 0.45,
+def index_task(
+    db: Session, user_id: str, task_id: int, title: str, description: str | None
 ):
-    ensure_collection()
+    content = f"Title: {title}\nDescription: {description or ''}"
+    vector = create_embedding(content)
+    row = db.get(TaskEmbedding, task_id)
+    if row is None:
+        row = TaskEmbedding(
+            task_id=task_id, user_id=user_id, content=content, embedding=vector
+        )
+        db.add(row)
+    else:
+        row.user_id, row.content, row.embedding = user_id, content, vector
+    db.commit()
 
-    query_vector = create_embedding(query)
 
-    results = client.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        limit=limit,
-        score_threshold=score_threshold,
-        with_payload=True,
-    )
+def delete_task_vector(db: Session, task_id: int):
+    row = db.get(TaskEmbedding, task_id)
+    if row:
+        db.delete(row)
+        db.commit()
 
+
+def search_similar_tasks(db: Session, user_id: str, query: str, limit: int = 5):
+    if db.bind.dialect.name != "postgresql":
+        raise RuntimeError("Semantic search requires PostgreSQL with pgvector")
+    vector = create_embedding(query)
+    distance = TaskEmbedding.embedding.cosine_distance(vector)
+    rows = db.execute(
+        select(TaskEmbedding, distance.label("distance"))
+        .where(TaskEmbedding.user_id == user_id)
+        .order_by(distance)
+        .limit(limit)
+    ).all()
     return [
-        {
-            "task_id": point.payload["task_id"],
-            "title": point.payload["title"],
-            "description": point.payload["description"],
-            "score": point.score,
-        }
-        for point in results.points
+        {"task_id": row.task_id, "score": 1 - float(distance)}
+        for row, distance in rows
+        if distance is not None
     ]

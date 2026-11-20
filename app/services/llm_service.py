@@ -1,36 +1,198 @@
 import json
-import requests
-
 from datetime import date
 from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, ValidationError
-
-from app.database import SessionLocal
-
-from app.agent.tools import (
-    list_tasks_tool,
-    search_tasks_tool,
-    create_task_tool,
-    get_task_tool,
-    update_task_tool,
-    complete_task_tool,
-    delete_task_tool,
-)
-from app.schemas import TaskUpdate
-from app.agent.tools import find_relevant_tasks_tool
-
 from sqlalchemy.orm import Session
 
+from app.agent.tools import (
+    complete_task_tool,
+    create_task_tool,
+    delete_task_tool,
+    find_relevant_tasks_tool,
+    get_task_tool,
+    list_tasks_tool,
+    search_tasks_tool,
+    update_task_tool,
+)
+from app.core.config import get_settings
+from app.schemas import TaskUpdate
 from app.services.conversation_service import (
     get_conversation_history,
     save_message,
 )
 
-
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "qwen2.5:3b"
+settings = get_settings()
+AI_PROVIDER = settings.ai_provider.strip().lower()
+MODEL_NAME = (
+    settings.ollama_model if AI_PROVIDER == "ollama" else settings.gemini_model
+)
 MAX_ROUNDS = 5
 MAX_PREVIOUS_MESSAGES = 10
+
+
+def get_llm_client():
+    from openai import OpenAI
+
+    settings = get_settings()
+    provider = settings.ai_provider.strip().lower()
+    if provider == "ollama":
+        return OpenAI(
+            api_key="ollama",
+            base_url=f"{settings.ollama_base_url.rstrip('/')}/",
+            timeout=120,
+            max_retries=0,
+        )
+    raise RuntimeError("OpenAI-compatible client is only used with Ollama")
+
+
+def get_gemini_client():
+    from google import genai
+    from google.genai import types
+
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    return genai.Client(
+        api_key=settings.gemini_api_key,
+        http_options=types.HttpOptions(
+            timeout=30_000,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+
+
+def generate_gemini_message(messages: list[dict], function_tools: list[dict]):
+    import uuid
+
+    from google.genai import types
+
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
+    client = get_gemini_client()
+
+    system_instructions = []
+    contents = []
+    call_names = {}
+
+    for message in messages:
+        role = message.get("role")
+        if role == "system":
+            if message.get("content"):
+                system_instructions.append(message["content"])
+        elif role == "user":
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=message.get("content", ""))],
+                )
+            )
+        elif role == "assistant":
+            stored_content = message.get("_gemini_content")
+            if stored_content:
+                contents.append(types.Content.model_validate(stored_content))
+                for call in message.get("tool_calls", []):
+                    call_names[call["id"]] = call["function"]["name"]
+                continue
+            parts = []
+            if message.get("content"):
+                parts.append(types.Part.from_text(text=message["content"]))
+            for call in message.get("tool_calls", []):
+                function = call["function"]
+                arguments = json.loads(function.get("arguments") or "{}")
+                call_names[call["id"]] = function["name"]
+                parts.append(
+                    types.Part.from_function_call(
+                        name=function["name"], args=arguments
+                    )
+                )
+            if parts:
+                contents.append(types.Content(role="model", parts=parts))
+        elif role == "tool":
+            function_name = call_names.get(message.get("tool_call_id"))
+            if not function_name:
+                raise RuntimeError("Gemini tool response has no matching function call")
+            try:
+                result = json.loads(message.get("content", "{}"))
+            except json.JSONDecodeError:
+                result = {"result": message.get("content", "")}
+            if not isinstance(result, dict):
+                result = {"result": result}
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_function_response(
+                            name=function_name,
+                            response=result,
+                        )
+                    ],
+                )
+            )
+
+    declarations = []
+    for item in function_tools:
+        function = item["function"]
+        parameters = dict(function.get("parameters") or {})
+        parameters.setdefault("type", "object")
+        declarations.append(
+            types.FunctionDeclaration(
+                name=function["name"],
+                description=function.get("description", ""),
+                parameters_json_schema=parameters,
+            )
+        )
+
+    config = types.GenerateContentConfig(
+        system_instruction="\n\n".join(system_instructions) or None,
+        tools=(
+            [types.Tool(function_declarations=declarations)]
+            if declarations
+            else None
+        ),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            disable=True
+        ),
+    )
+    response = client.models.generate_content(
+        model=settings.gemini_model,
+        contents=contents,
+        config=config,
+    )
+
+    text_parts = []
+    tool_calls = []
+    candidates = response.candidates or []
+    if candidates and candidates[0].content:
+        for part in candidates[0].content.parts or []:
+            if part.text:
+                text_parts.append(part.text)
+            function_call = part.function_call
+            if function_call:
+                tool_calls.append(
+                    {
+                        "id": function_call.id or uuid.uuid4().hex,
+                        "type": "function",
+                        "function": {
+                            "name": function_call.name,
+                            "arguments": json.dumps(function_call.args or {}),
+                        },
+                    }
+                )
+
+    raw_content = (
+        candidates[0].content.model_dump(mode="json", exclude_none=True)
+        if candidates and candidates[0].content
+        else None
+    )
+    return {
+        "content": "".join(text_parts),
+        "tool_calls": tool_calls,
+        "_gemini_content": raw_content,
+    }
+
 
 class ListTasksArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -206,7 +368,9 @@ tools = [
         "type": "function",
         "function": {
             "name": "delete_task",
-            "description": "Permanently delete a task when the user explicitly requests deletion.",
+            "description": (
+                "Permanently delete a task when the user explicitly requests deletion."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -295,7 +459,7 @@ Rules:
 """
 
 
-def execute_tool(tool_name: str, arguments: dict):
+def execute_tool(db: Session, user_id: str, tool_name: str, arguments: dict):
     # Each tool has an approved argument schema and Python function.
     tool_map = {
         "list_tasks": (ListTasksArgs, list_tasks_tool),
@@ -323,24 +487,16 @@ def execute_tool(tool_name: str, arguments: dict):
         # Convert validated arguments into a Python dictionary.
         data = validated_args.model_dump(exclude_unset=True)
 
-        # Other tools use the SQLite database.
-        db = SessionLocal()
-
-        try:
-            if tool_name == "create_task":
-                return tool_function(db=db, task_data=data)
-
-            if tool_name == "update_task":
-                return tool_function(
-                    db=db,
-                    task_id=data["task_id"],
-                    task_data=data["task_data"],
-                )
-
-            return tool_function(db=db, **data)
-
-        finally:
-            db.close()
+        if tool_name == "create_task":
+            return tool_function(db=db, user_id=user_id, task_data=data)
+        if tool_name == "update_task":
+            return tool_function(
+                db=db,
+                user_id=user_id,
+                task_id=data["task_id"],
+                task_data=data["task_data"],
+            )
+        return tool_function(db=db, user_id=user_id, **data)
 
     except ValidationError as error:
         return {
@@ -349,21 +505,24 @@ def execute_tool(tool_name: str, arguments: dict):
         }
 
 
-def ask_ollama(
-    db: Session,
-    conversation_id: int,
-    user_message: str,
+def ask_gemini(
+    db: Session, user_id: str, conversation_id: int, user_message: str
 ) -> str:
 
-    # Load previous messages from SQLite.
+    # Import here to avoid a circular import
+    from app.agent.workflow import run_agent
+
+    # Retrieve previous conversation messages
     history = get_conversation_history(
-    db=db,
-    conversation_id=conversation_id,
+        db=db,
+        user_id=user_id,
+        conversation_id=conversation_id,
     )
 
     # Keep only the 10 most recent previous messages
     history = history[-MAX_PREVIOUS_MESSAGES:]
-    # Save the new user message.
+
+    # Save the new user message to PostgreSQL.
     save_message(
         db=db,
         conversation_id=conversation_id,
@@ -371,88 +530,21 @@ def ask_ollama(
         content=user_message,
     )
 
-    # Build the conversation context.
+    # Prepare the initial agent context
     messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT,
-        },
+        {"role": "system", "content": SYSTEM_PROMPT},
         *history,
-        {
-            "role": "user",
-            "content": user_message,
-        },
+        {"role": "user", "content": user_message},
     ]
 
-    # Allow up to MAX_ROUNDS of model/tool interaction.
-    for _ in range(MAX_ROUNDS):
-        try:
-            response = requests.post(
-                OLLAMA_URL,
-                json={
-                    "model": MODEL_NAME,
-                    "messages": messages,
-                    "tools": tools,
-                    "stream": False,
-                },
-                timeout=120,
-            )
+    # Execute the LangGraph workflow
+    answer = run_agent(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        messages=messages,
+    )
 
-            response.raise_for_status()
-
-        except requests.RequestException:
-            answer = (
-                "Unable to connect to Ollama. "
-                "Please check whether the local AI model is running."
-            )
-
-            save_message(db, conversation_id, "assistant", answer)
-            return answer
-
-        result = response.json()
-        assistant_message = result["message"]
-
-        # Keep the assistant response in the current LLM context.
-        messages.append(assistant_message)
-
-        tool_calls = assistant_message.get("tool_calls", [])
-
-        # No more tool requests: save and return final answer.
-        if not tool_calls:
-            answer = assistant_message.get("content", "")
-
-            save_message(
-                db=db,
-                conversation_id=conversation_id,
-                role="assistant",
-                content=answer,
-            )
-
-            return answer
-
-        # Execute every requested tool.
-        for tool_call in tool_calls:
-            function = tool_call["function"]
-
-            tool_name = function["name"]
-            arguments = function["arguments"]
-
-            tool_result = execute_tool(
-                tool_name=tool_name,
-                arguments=arguments,
-            )
-
-            # Send the execution result back to Ollama.
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_name": tool_name,
-                    "content": json.dumps(tool_result, default=str),
-                }
-            )
-
-    answer = "I couldn't complete the request " "within the allowed tool-call limit."
-
+    # Save the final assistant response
     save_message(
         db=db,
         conversation_id=conversation_id,

@@ -1,8 +1,11 @@
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.core.auth import get_current_user
+from app.core.rate_limit import limiter
 from app.database import get_db
 from app.services.conversation_service import (
     create_conversation,
@@ -10,17 +13,19 @@ from app.services.conversation_service import (
     get_conversation_history,
     get_conversations,
 )
-from app.services.llm_service import ask_ollama
+from app.services.llm_service import ask_gemini
 
 router = APIRouter()
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=4000)
+    conversation_id: int | None = None
 
 
 class ChatResponse(BaseModel):
     answer: str
+    conversation_id: int
 
 
 class ConversationSummary(BaseModel):
@@ -42,15 +47,33 @@ class ConversationDetail(BaseModel):
 
 
 @router.post("/", response_model=ChatResponse)
-def chat(request: ChatRequest):
-    answer = ask_ollama(request.message)
+@limiter.limit("20/minute")
+def chat(
+    body: ChatRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    conversation = (
+        get_conversation(db, user["id"], body.conversation_id)
+        if body.conversation_id is not None
+        else create_conversation(db, user["id"])
+    )
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    answer = ask_gemini(db, user["id"], conversation.id, body.message)
 
-    return ChatResponse(answer=answer)
+    return ChatResponse(answer=answer, conversation_id=conversation.id)
 
 
 @router.get("/conversations", response_model=list[ConversationSummary])
-def list_conversations(db: Session = Depends(get_db)):
-    conversations = get_conversations(db)
+@limiter.limit("120/minute")
+def list_conversations(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    conversations = get_conversations(db, user["id"])
 
     return conversations
 
@@ -59,11 +82,14 @@ def list_conversations(db: Session = Depends(get_db)):
     "/conversations/{conversation_id}",
     response_model=ConversationDetail,
 )
+@limiter.limit("120/minute")
 def retrieve_conversation(
+    request: Request,
     conversation_id: int,
     db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
 ):
-    conversation = get_conversation(db, conversation_id)
+    conversation = get_conversation(db, user["id"], conversation_id)
 
     if conversation is None:
         raise HTTPException(
@@ -73,6 +99,7 @@ def retrieve_conversation(
 
     messages = get_conversation_history(
         db=db,
+        user_id=user["id"],
         conversation_id=conversation_id,
     )
 

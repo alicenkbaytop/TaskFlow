@@ -1,8 +1,25 @@
-import requests
-import streamlit as st
+import os
 from datetime import date
 
-API_URL = "http://localhost:8000"
+import requests
+import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+
+def setting(name, default=""):
+    if name in os.environ:
+        return os.environ[name]
+    try:
+        return st.secrets.get(name, default)
+    except (AttributeError, FileNotFoundError, KeyError):
+        return default
+
+
+API_URL = setting("TASKFLOW_API_URL", "http://localhost:8000").rstrip("/")
+SUPABASE_URL = setting("SUPABASE_URL").rstrip("/")
+SUPABASE_ANON_KEY = setting("SUPABASE_ANON_KEY")
 PAGE_SIZE = 10
 
 st.set_page_config(page_title="TaskFlow", page_icon="✅", layout="wide")
@@ -59,13 +76,105 @@ def reset_page():
 
 
 def api_request(method, endpoint, **kwargs):
-    response = requests.request(method, f"{API_URL}{endpoint}", timeout=10, **kwargs)
+    headers = kwargs.pop("headers", {})
+    if st.session_state.get("access_token"):
+        headers["Authorization"] = f"Bearer {st.session_state.access_token}"
+    timeout = kwargs.pop("timeout", 30)
+    response = requests.request(
+        method, f"{API_URL}{endpoint}", headers=headers, timeout=timeout, **kwargs
+    )
     response.raise_for_status()
     return response
 
 
 if "page" not in st.session_state:
     st.session_state.page = 0
+
+if not st.session_state.get("access_token"):
+    st.title("TaskFlow sign in")
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        st.error("Configure SUPABASE_URL and SUPABASE_ANON_KEY for the frontend.")
+        st.stop()
+    auth_mode = st.radio("Account", ["Sign in", "Create account"], horizontal=True)
+    with st.form("auth_form"):
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        submit_auth = st.form_submit_button(auth_mode, type="primary")
+    if submit_auth:
+        auth_path = (
+            "/auth/v1/token?grant_type=password"
+            if auth_mode == "Sign in"
+            else "/auth/v1/signup"
+        )
+        try:
+            auth_response = requests.post(
+                f"{SUPABASE_URL}{auth_path}",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={"email": email.strip(), "password": password},
+                timeout=15,
+            )
+            auth_response.raise_for_status()
+            auth_data = auth_response.json()
+            if not auth_data.get("access_token"):
+                st.success("Check your email to confirm your account, then sign in.")
+            else:
+                st.session_state.access_token = auth_data["access_token"]
+                st.rerun()
+        except requests.RequestException as error:
+            error_code = None
+            if error.response is not None:
+                try:
+                    error_code = error.response.json().get("error_code")
+                except ValueError:
+                    pass
+            if error_code == "invalid_credentials":
+                st.error(
+                    "Supabase did not accept that email and password. If this is a "
+                    "new account, choose Create account and confirm the email before "
+                    "signing in. Otherwise, check the email address and password."
+                )
+            elif error_code == "email_not_confirmed":
+                st.error(
+                    "Confirm your account using the link sent to your email, "
+                    "then sign in."
+                )
+            elif error_code == "over_email_send_rate_limit":
+                st.error(
+                    "Supabase temporarily blocked signup email delivery because "
+                    "the project's email quota was reached. Stop retrying for now "
+                    "and check your inbox and spam folder for the first confirmation "
+                    "email. If none arrived, wait for the quota window to reset, then "
+                    "try Create account once. For ongoing use, configure custom SMTP "
+                    "in Supabase Auth."
+                )
+            else:
+                detail = (
+                    error.response.text
+                    if error.response is not None
+                    else str(error)
+                )
+                st.error(f"Authentication failed: {detail}")
+    st.stop()
+
+if st.sidebar.button("Sign out"):
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/auth/v1/logout",
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {st.session_state.access_token}",
+            },
+            timeout=10,
+        )
+    except requests.RequestException:
+        pass
+    st.session_state.pop("access_token", None)
+    st.session_state.pop("conversation_id", None)
+    st.session_state.pop("selected_conversation_id", None)
+    st.rerun()
 
 
 # -------------------------
@@ -75,7 +184,7 @@ if "page" not in st.session_state:
 st.title("TaskFlow")
 
 st.markdown(
-    '<p class="subtitle">' "Organize your work. Focus on what matters." "</p>",
+    '<p class="subtitle">Organize your work. Focus on what matters.</p>',
     unsafe_allow_html=True,
 )
 
@@ -85,9 +194,7 @@ st.markdown(
 # -------------------------
 
 with st.expander("＋ Create a new task"):
-
     with st.form("create_task_form", clear_on_submit=True):
-
         title = st.text_input("Task title")
         description = st.text_area("Description")
 
@@ -104,7 +211,6 @@ with st.expander("＋ Create a new task"):
         )
 
         if submitted:
-
             if not title.strip():
                 st.warning("Please enter a task title.")
 
@@ -180,7 +286,6 @@ if priority_filter != "All":
 
 
 try:
-
     response = api_request("GET", "/tasks", params=params)
 
     tasks = response.json()
@@ -192,35 +297,30 @@ try:
         st.info("No tasks found. Create a task or change your filters.")
 
     else:
-
         # -------------------------
         # Compact task cards
         # -------------------------
 
         for task in tasks:
-
             with st.container(border=True):
-
                 col1, col2 = st.columns([10, 2])
 
                 with col1:
-
                     # Title
                     st.write(task["title"])
 
                     # Compact metadata
                     st.caption(
-                        f'{task["status"].replace("_", " ").title()}'
-                        f'  ·  {task["priority"].title()}'
-                        f'  ·  Due: {task["due_date"] or "Not set"}'
+                        f"{task['status'].replace('_', ' ').title()}"
+                        f"  ·  {task['priority'].title()}"
+                        f"  ·  Due: {task['due_date'] or 'Not set'}"
                     )
 
                 with col2:
-
                     st.markdown(
                         f'<div style="text-align:right; color:#808495;'
                         f'font-size:12px;">'
-                        f'{task["status"].replace("_", " ").title()}'
+                        f"{task['status'].replace('_', ' ').title()}"
                         f"</div>",
                         unsafe_allow_html=True,
                     )
@@ -230,7 +330,6 @@ try:
                 # -------------------------
 
                 with st.expander("View details and edit"):
-
                     st.markdown("**Description**")
 
                     st.write(
@@ -243,9 +342,9 @@ try:
 
                     st.markdown("**Task information**")
 
-                    st.caption(f'Created: {task["created_at"]}')
+                    st.caption(f"Created: {task['created_at']}")
 
-                    st.caption(f'Last updated: {task["updated_at"]}')
+                    st.caption(f"Last updated: {task['updated_at']}")
 
                     # -------------------------
                     # Edit task
@@ -260,7 +359,6 @@ try:
                     )
 
                     with st.form(f"update_form_{task['id']}"):
-
                         new_title = st.text_input(
                             "Title", value=task["title"], key=f"title_{task['id']}"
                         )
@@ -303,7 +401,6 @@ try:
                         )
 
                         if save:
-
                             if not new_title.strip():
                                 st.warning("Task title cannot be empty.")
 
@@ -311,7 +408,7 @@ try:
                                 try:
                                     api_request(
                                         "PUT",
-                                        f'/tasks/{task["id"]}',
+                                        f"/tasks/{task['id']}",
                                         json={
                                             "title": new_title.strip(),
                                             "description": new_description,
@@ -347,9 +444,8 @@ try:
                         disabled=not confirm_delete,
                         use_container_width=True,
                     ):
-
                         try:
-                            api_request("DELETE", f'/tasks/{task["id"]}')
+                            api_request("DELETE", f"/tasks/{task['id']}")
 
                             st.success("Task deleted!")
                             st.rerun()
@@ -366,7 +462,6 @@ try:
     col1, col2, col3 = st.columns([1, 2, 1])
 
     with col1:
-
         if st.button(
             "← Previous", disabled=st.session_state.page == 0, use_container_width=True
         ):
@@ -374,7 +469,6 @@ try:
             st.rerun()
 
     with col2:
-
         st.markdown(
             f"<p style='text-align:center; padding-top:5px;'>"
             f"Page {st.session_state.page + 1}</p>",
@@ -382,14 +476,12 @@ try:
         )
 
     with col3:
-
         if st.button("Next →", disabled=not has_next, use_container_width=True):
             st.session_state.page += 1
             st.rerun()
 
 
 except requests.RequestException as error:
-
     st.error(
         "Unable to connect to TaskFlow backend. "
         "Make sure FastAPI is running. "
@@ -445,7 +537,6 @@ selected_id = st.sidebar.selectbox(
 
 # Load selected conversation when selection changes
 if selected_id != st.session_state.conversation_id:
-
     if selected_id is None:
         st.session_state.conversation_id = None
         st.session_state.chat_history = []
@@ -467,7 +558,6 @@ if selected_id != st.session_state.conversation_id:
 # -------------------------
 
 for message in st.session_state.chat_history:
-
     with st.chat_message(message["role"]):
         st.write(message["content"])
 
@@ -477,7 +567,6 @@ for message in st.session_state.chat_history:
 # -------------------------
 
 if prompt := st.chat_input("Ask TaskFlow something..."):
-
     # Display and save user message
     st.session_state.chat_history.append(
         {
@@ -496,37 +585,35 @@ if prompt := st.chat_input("Ask TaskFlow something..."):
     }
 
     # Ask the backend
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant"), st.spinner("Thinking..."):
+        try:
+            response = api_request(
+                "POST",
+                "/chat/",
+                timeout=300,
+                json=payload,
+            )
 
-        with st.spinner("Thinking..."):
+            result = response.json()
 
-            try:
-                response = api_request(
-                    "POST",
-                    "/chat/",
-                    json=payload,
-                )
+            # Store the conversation ID returned by the backend
+            st.session_state.conversation_id = result["conversation_id"]
 
-                result = response.json()
+            answer = result["answer"]
 
-                # Store the conversation ID returned by the backend
-                st.session_state.conversation_id = result["conversation_id"]
+            st.write(answer)
 
-                answer = result["answer"]
+            st.session_state.chat_history.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                }
+            )
 
-                st.write(answer)
+        except requests.HTTPError as error:
+            st.error(f"Backend returned an error: {error.response.text}")
 
-                st.session_state.chat_history.append(
-                    {
-                        "role": "assistant",
-                        "content": answer,
-                    }
-                )
-
-            except requests.HTTPError as error:
-                st.error(f"Backend returned an error: {error.response.text}")
-
-            except requests.RequestException as error:
-                st.error(f"Could not connect to the AI backend: {error}")
+        except requests.RequestException as error:
+            st.error(f"Could not connect to the AI backend: {error}")
 
     st.rerun()

@@ -5,6 +5,12 @@ def test_get_tasks(client):
     assert isinstance(response.json(), list)
 
 
+def test_health_check(client):
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 def test_create_task(client):
     response = client.post(
         "/tasks",
@@ -60,7 +66,6 @@ def test_sort_tasks_by_priority(client):
     priorities = [task["priority"] for task in tasks]
 
     assert priorities == ["high", "medium", "low"]
-    
 
 
 def test_update_task(client):
@@ -94,3 +99,55 @@ def test_delete_task(client):
     get_response = client.get(f"/tasks/{task_id}")
 
     assert get_response.status_code == 404
+
+
+def test_task_isolation_by_authenticated_user(client):
+    created = client.post("/tasks", json={"title": "Private task"})
+    task_id = created.json()["id"]
+    from app.core.auth import get_current_user
+    from main import app
+
+    app.dependency_overrides[get_current_user] = lambda: {"id": "test-user-b"}
+    try:
+        assert client.get(f"/tasks/{task_id}").status_code == 404
+        assert client.get("/tasks").json() == []
+        assert (
+            client.put(f"/tasks/{task_id}", json={"title": "stolen"}).status_code == 404
+        )
+        assert client.delete(f"/tasks/{task_id}").status_code == 404
+    finally:
+        app.dependency_overrides[get_current_user] = lambda: {"id": "test-user-a"}
+
+
+def test_chat_conversations_are_user_scoped(client, monkeypatch):
+    from app.api import chat as chat_api
+    from app.core.auth import get_current_user
+    from main import app
+
+    monkeypatch.setattr(chat_api, "ask_gemini", lambda *args: "Hello")
+    created = client.post("/chat/", json={"message": "Hello"})
+    assert created.status_code == 200
+    conversation_id = created.json()["conversation_id"]
+    app.dependency_overrides[get_current_user] = lambda: {"id": "test-user-b"}
+    try:
+        assert client.get("/chat/conversations").json() == []
+        assert client.get(f"/chat/conversations/{conversation_id}").status_code == 404
+        assert (
+            client.post(
+                "/chat/", json={"message": "Hello", "conversation_id": conversation_id}
+            ).status_code
+            == 404
+        )
+    finally:
+        app.dependency_overrides[get_current_user] = lambda: {"id": "test-user-a"}
+
+
+def test_protected_api_requires_authentication(client):
+    from app.core.auth import get_current_user
+    from main import app
+
+    app.dependency_overrides.pop(get_current_user)
+    try:
+        assert client.get("/tasks").status_code == 401
+    finally:
+        app.dependency_overrides[get_current_user] = lambda: {"id": "test-user-a"}
