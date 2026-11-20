@@ -1,16 +1,24 @@
 import json
-import requests
+import logging
+import time
 
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import END, START, StateGraph
+from opentelemetry import trace
 
 from app.agent.state import AgentState
+from app.database import SessionLocal
 from app.services.llm_service import (
-    OLLAMA_URL,
+    AI_PROVIDER,
     MODEL_NAME,
-    SYSTEM_PROMPT,
-    tools,
     execute_tool,
+    generate_gemini_message,
+    get_llm_client,
+    tools,
 )
+
+logger = logging.getLogger(__name__)
+
+tracer = trace.get_tracer(__name__)
 
 MAX_TOOL_ROUNDS = 5
 
@@ -22,30 +30,104 @@ MAX_TOOL_ROUNDS = 5
 
 def agent_node(state: AgentState):
 
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": MODEL_NAME,
-                "messages": state["messages"],
-                "tools": tools,
-                "stream": False,
-            },
-            timeout=120,
-        )
+    start_time = time.perf_counter()
 
-        response.raise_for_status()
+    with tracer.start_as_current_span("agent.llm_request") as span:
+        span.set_attribute("llm.model", MODEL_NAME)
 
-    except requests.RequestException:
-        return {
-            "answer": (
-                "Unable to connect to Ollama. "
-                "Please check whether the local AI model is running."
+        try:
+            if AI_PROVIDER == "gemini":
+                assistant_message = generate_gemini_message(
+                    state["messages"], tools
+                )
+            else:
+                response = get_llm_client().chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=state["messages"],
+                    tools=tools,
+                )
+                choice = response.choices[0].message
+                assistant_message = {
+                    "content": choice.content or "",
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.function.name,
+                                "arguments": call.function.arguments,
+                            },
+                        }
+                        for call in (choice.tool_calls or [])
+                    ],
+                }
+            span.set_attribute("llm.success", True)
+
+        except Exception as error:
+            span.set_attribute("llm.success", False)
+            span.set_attribute("error.type", type(error).__name__)
+            status_code = getattr(error, "status_code", None) or getattr(
+                error, "code", None
             )
-        }
+            logger.error(
+                "AI request failed: provider=%s model=%s type=%s status=%s",
+                AI_PROVIDER,
+                MODEL_NAME,
+                type(error).__name__,
+                status_code,
+            )
 
-    result = response.json()
-    assistant_message = result["message"]
+            error_type = type(error).__name__
+            if error_type == "AuthenticationError" or status_code in (401, 403):
+                answer = f"The {AI_PROVIDER} provider rejected its credentials."
+            elif error_type == "RateLimitError" or status_code == 429:
+                answer = f"The {AI_PROVIDER} provider rate limit was reached."
+            elif "Timeout" in error_type or status_code == 504:
+                answer = "The AI provider did not respond in time. Please try again."
+            elif error_type == "APIConnectionError":
+                answer = (
+                    "TaskFlow could not connect to the AI provider. "
+                    "Check that Ollama is running or verify the Gemini connection."
+                )
+            elif status_code == 404:
+                answer = (
+                    f"AI model '{MODEL_NAME}' is unavailable. "
+                    "Check the selected provider and model setting."
+                )
+            elif status_code == 503:
+                answer = (
+                    "The AI provider is temporarily unavailable (503). "
+                    "Please try again in a few minutes."
+                )
+            elif isinstance(error, RuntimeError) and "GEMINI_API_KEY" in str(error):
+                answer = "GEMINI_API_KEY is not configured in the backend environment."
+            elif isinstance(error, RuntimeError):
+                answer = str(error)
+            else:
+                answer = (
+                    "The AI provider could not complete the request. "
+                    "Check the FastAPI logs for the provider error."
+                )
+            return {"answer": answer}
+
+    duration = (time.perf_counter() - start_time) * 1000
+
+    logger.info(
+        "AI provider: %s | model: %s | Duration: %.2f ms",
+        AI_PROVIDER,
+        MODEL_NAME,
+        duration,
+    )
+
+    generated_message = assistant_message
+    assistant_message = {
+        "role": "assistant",
+        "content": generated_message.get("content", ""),
+    }
+    if response_tool_calls := generated_message.get("tool_calls"):
+        assistant_message["tool_calls"] = response_tool_calls
+    if gemini_content := generated_message.get("_gemini_content"):
+        assistant_message["_gemini_content"] = gemini_content
 
     # Add the LLM response to the conversation context
     updated_messages = state["messages"] + [assistant_message]
@@ -57,7 +139,7 @@ def agent_node(state: AgentState):
         return {
             "messages": updated_messages,
             "answer": (
-                "I couldn't complete the request within " "the allowed tool-call limit."
+                "I couldn't complete the request within the allowed tool-call limit."
             ),
         }
 
@@ -86,31 +168,53 @@ def tool_node(state: AgentState):
     tool_calls = assistant_message.get("tool_calls", [])
 
     for tool_call in tool_calls:
-
         function = tool_call["function"]
 
         tool_name = function["name"]
-        arguments = function["arguments"]
-
         try:
-            # Execute the existing validated application tool
-            tool_result = execute_tool(
-                tool_name=tool_name,
-                arguments=arguments,
-            )
+            arguments = json.loads(function["arguments"])
+        except (TypeError, json.JSONDecodeError):
+            arguments = None
 
-        except Exception as error:
-            # Return the error to the LLM instead of stopping the workflow
-            tool_result = {
-                "error": str(error),
-                "tool": tool_name,
-            }
+        start_time = time.perf_counter()
+        with tracer.start_as_current_span("agent.tool_execution") as span:
+            span.set_attribute("tool.name", tool_name)
 
-        # Return either the successful result or error to Ollama
+            db = SessionLocal()
+
+            try:
+                tool_result = execute_tool(
+                    db=db,
+                    user_id=state["user_id"],
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
+                if arguments is None:
+                    tool_result = {"error": "Invalid tool arguments"}
+
+                span.set_attribute("tool.success", True)
+
+            except Exception as error:
+                tool_result = {"error": "Tool execution failed", "tool": tool_name}
+
+                span.set_attribute("tool.success", False)
+                span.set_attribute("error.type", type(error).__name__)
+
+            finally:
+                db.close()
+
+        duration = (time.perf_counter() - start_time) * 1000
+
+        logger.info(
+            "Tool: %s | Duration: %.2f ms",
+            tool_name,
+            duration,
+        )
+        # Return either the successful result or error to the selected provider.
         messages.append(
             {
                 "role": "tool",
-                "tool_name": tool_name,
+                "tool_call_id": tool_call["id"],
                 "content": json.dumps(tool_result, default=str),
             }
         )
@@ -172,11 +276,13 @@ agent_graph = build_agent_graph()
 
 def run_agent(
     conversation_id: int,
+    user_id: str,
     messages: list[dict],
 ):
 
     initial_state = {
         "conversation_id": conversation_id,
+        "user_id": user_id,
         "messages": messages,
         "answer": "",
         "tool_rounds": 0,
@@ -191,4 +297,4 @@ def run_agent(
         return result["answer"]
 
     except Exception:
-        return "The AI workflow encountered an unexpected error. " "Please try again."
+        return "The AI workflow encountered an unexpected error. Please try again."

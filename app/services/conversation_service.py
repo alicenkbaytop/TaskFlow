@@ -1,11 +1,11 @@
-from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.models import Conversation, Message
 
 
-def create_conversation(db: Session):
-    conversation = Conversation()
+def create_conversation(db: Session, user_id: str):
+    conversation = Conversation(user_id=user_id)
 
     db.add(conversation)
     db.commit()
@@ -33,17 +33,25 @@ def save_message(
     return message
 
 
-def get_conversation(db: Session, conversation_id: int):
-    return db.get(Conversation, conversation_id)
+def get_conversation(db: Session, user_id: str, conversation_id: int):
+    return db.scalar(
+        select(Conversation).where(
+            Conversation.id == conversation_id, Conversation.user_id == user_id
+        )
+    )
 
 
 def get_conversation_history(
     db: Session,
+    user_id: str,
     conversation_id: int,
 ):
     statement = (
         select(Message)
-        .where(Message.conversation_id == conversation_id)
+        .join(Conversation)
+        .where(
+            Message.conversation_id == conversation_id, Conversation.user_id == user_id
+        )
         .order_by(Message.id.asc())
     )
 
@@ -58,7 +66,11 @@ def get_conversation_history(
     ]
 
 
-def get_conversations(db: Session):
-    statement = select(Conversation).order_by(Conversation.created_at.desc())
+def get_conversations(db: Session, user_id: str):
+    statement = (
+        select(Conversation)
+        .where(Conversation.user_id == user_id)
+        .order_by(Conversation.created_at.desc())
+    )
 
     return db.scalars(statement).all()

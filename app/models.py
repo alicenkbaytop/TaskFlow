@@ -1,9 +1,9 @@
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
-from sqlalchemy import Date, DateTime, String
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import ForeignKey, Text
-from sqlalchemy.orm import relationship
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import JSON, Date, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
 
 class Base(DeclarativeBase):
     pass
@@ -13,6 +13,8 @@ class Task(Base):
     __tablename__ = "tasks"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+
+    user_id: Mapped[str] = mapped_column(String(255), index=True)
 
     title: Mapped[str] = mapped_column(String(200))
 
@@ -26,13 +28,13 @@ class Task(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
     )
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
     )
 
 
@@ -41,6 +43,8 @@ class Conversation(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
 
+    user_id: Mapped[str] = mapped_column(String(255), index=True)
+
     title: Mapped[str] = mapped_column(
         String(200),
         default="New conversation",
@@ -48,7 +52,7 @@ class Conversation(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
     )
 
     # One conversation can contain multiple messages.
@@ -74,10 +78,24 @@ class Message(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
     )
 
     # Each message belongs to one conversation.
     conversation: Mapped["Conversation"] = relationship(
         back_populates="messages",
+    )
+
+
+class TaskEmbedding(Base):
+    __tablename__ = "task_embeddings"
+    __table_args__ = (Index("ix_task_embeddings_user_id", "user_id"),)
+
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(768).with_variant(JSON(), "sqlite"), nullable=False
     )

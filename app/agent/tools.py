@@ -1,25 +1,27 @@
-from sqlalchemy.orm import Session
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
-
-from app.services.task_service import (
-    get_tasks,
-    get_task_by_id,
-    search_tasks,
-    create_task,
-    update_task,
-    delete_task,
-)
 from app.schemas import TaskCreate, TaskUpdate
+from app.services.task_service import (
+    create_task,
+    delete_task,
+    get_task_by_id,
+    get_tasks,
+    search_tasks,
+    update_task,
+)
 from app.services.vector_service import search_similar_tasks
+
 
 def list_tasks_tool(
     db: Session,
+    user_id: str,
     status_filter: str | None = None,
     priority: str | None = None,
 ):
     tasks = get_tasks(
         db=db,
+        user_id=user_id,
         status_filter=status_filter,
         priority=priority,
         limit=50,
@@ -38,13 +40,14 @@ def list_tasks_tool(
     ]
 
 
-def search_tasks_tool(db: Session, title: str):
+def search_tasks_tool(db: Session, user_id: str, title: str):
 
     if not title.strip():
         return {"error": "Search title cannot be empty"}
 
     tasks = search_tasks(
         db=db,
+        user_id=user_id,
         title=title,
     )
 
@@ -61,7 +64,7 @@ def search_tasks_tool(db: Session, title: str):
     ]
 
 
-def update_task_tool(db: Session, task_id: int, task_data: dict):
+def update_task_tool(db: Session, user_id: str, task_id: int, task_data: dict):
 
     try:
         validated_data = TaskUpdate(**task_data)
@@ -71,6 +74,7 @@ def update_task_tool(db: Session, task_id: int, task_data: dict):
 
     task = update_task(
         db=db,
+        user_id=user_id,
         task_id=task_id,
         task_data=validated_data,
     )
@@ -86,7 +90,7 @@ def update_task_tool(db: Session, task_id: int, task_data: dict):
     }
 
 
-def create_task_tool(db: Session, task_data: dict):
+def create_task_tool(db: Session, user_id: str, task_data: dict):
 
     try:
         validated_data = TaskCreate(**task_data)
@@ -96,6 +100,7 @@ def create_task_tool(db: Session, task_data: dict):
 
     task = create_task(
         db=db,
+        user_id=user_id,
         task_data=validated_data,
     )
 
@@ -109,10 +114,11 @@ def create_task_tool(db: Session, task_data: dict):
     }
 
 
-def get_task_tool(db: Session, task_id: int):
+def get_task_tool(db: Session, user_id: str, task_id: int):
 
     task = get_task_by_id(
         db=db,
+        user_id=user_id,
         task_id=task_id,
     )
 
@@ -129,12 +135,13 @@ def get_task_tool(db: Session, task_id: int):
     }
 
 
-def complete_task_tool(db: Session, task_id: int):
+def complete_task_tool(db: Session, user_id: str, task_id: int):
 
     task_data = TaskUpdate(status="completed")
 
     task = update_task(
         db=db,
+        user_id=user_id,
         task_id=task_id,
         task_data=task_data,
     )
@@ -149,10 +156,11 @@ def complete_task_tool(db: Session, task_id: int):
     }
 
 
-def delete_task_tool(db: Session, task_id: int):
+def delete_task_tool(db: Session, user_id: str, task_id: int):
 
     deleted = delete_task(
         db=db,
+        user_id=user_id,
         task_id=task_id,
     )
 
@@ -162,18 +170,18 @@ def delete_task_tool(db: Session, task_id: int):
     return {"success": True, "message": f"Task {task_id} was deleted successfully"}
 
 
-def find_relevant_tasks_tool(db: Session, query: str):
+def find_relevant_tasks_tool(db: Session, user_id: str, query: str):
     try:
-        # Qdrant finds relevant task IDs using semantic similarity.
-        results = search_similar_tasks(query, limit=5)
+        # PostgreSQL pgvector searches only this user's embeddings.
+        results = search_similar_tasks(db, user_id, query, limit=5)
 
         current_tasks = []
 
         for result in results:
             task_id = result["task_id"]
 
-            # SQLite provides the authoritative task record.
-            task = get_task_by_id(db=db, task_id=task_id)
+            # PostgreSQL task rows remain the authoritative records.
+            task = get_task_by_id(db=db, user_id=user_id, task_id=task_id)
 
             # Ignore stale vectors for deleted tasks.
             if task is None:
