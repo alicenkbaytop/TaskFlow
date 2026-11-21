@@ -1,5 +1,8 @@
 # TaskFlow
 
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-Try%20TaskFlow-brightgreen?style=for-the-badge)](https://taskflow-alicenkbaytop.streamlit.app)
+
+
 TaskFlow is a cloud-oriented task manager with an AI assistant. It combines a
 Streamlit interface, FastAPI services, Supabase Auth and PostgreSQL, pgvector
 retrieval, and a LangGraph tool workflow. Gemini is the default model provider;
