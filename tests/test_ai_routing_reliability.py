@@ -134,6 +134,24 @@ def test_retry_does_not_repeat_non_retryable_errors():
     assert len(calls) == 1
 
 
+def test_retry_count_is_attached_to_final_provider_error():
+    class Unavailable(Exception):
+        status_code = 503
+
+    def fail():
+        raise Unavailable()
+
+    with pytest.raises(Unavailable) as raised:
+        provider_reliability.with_retries(
+            fail,
+            attempts=3,
+            base_delay_seconds=0,
+            sleep=lambda delay: None,
+        )
+
+    assert raised.value.retry_count == 3
+
+
 def test_embedding_cache_is_user_scoped_and_invalidated(monkeypatch):
     monkeypatch.setattr(
         vector_service,

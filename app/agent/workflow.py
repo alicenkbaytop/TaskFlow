@@ -5,6 +5,7 @@ import time
 
 from langgraph.graph import END, START, StateGraph
 from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 
 from app.agent.state import AgentState
 from app.core.config import get_settings
@@ -81,10 +82,16 @@ def agent_node(state: AgentState):
             span.set_attribute("llm.provider", route.provider)
             span.set_attribute("llm.model", route.model)
             span.set_attribute("llm.retry_count", retry_count - 1)
+            span.set_attribute("llm.fallback_used", route != routes[0])
+            span.set_attribute("llm.latency_ms", duration)
 
         except Exception as error:
             span.set_attribute("llm.success", False)
             span.set_attribute("error.type", type(error).__name__)
+            span.set_status(Status(StatusCode.ERROR, type(error).__name__))
+            span.set_attribute(
+                "llm.latency_ms", (time.perf_counter() - start_time) * 1000
+            )
             status_code = getattr(error, "status_code", None) or getattr(
                 error, "code", None
             )
@@ -214,6 +221,8 @@ def tool_node(state: AgentState):
                 span.set_attribute("tool.name", tool_name)
                 span.set_attribute("tool.deduplicated", True)
                 span.set_attribute("tool.success", "error" not in tool_result)
+                if "error" in tool_result:
+                    span.set_attribute("tool.error", True)
             messages.append(
                 {
                     "role": "tool",
@@ -240,15 +249,21 @@ def tool_node(state: AgentState):
                     tool_result = {"error": "Invalid tool arguments"}
 
                 span.set_attribute("tool.success", "error" not in tool_result)
+                if "error" in tool_result:
+                    span.set_attribute("tool.error", True)
 
             except Exception as error:
                 tool_result = {"error": "Tool execution failed", "tool": tool_name}
 
                 span.set_attribute("tool.success", False)
                 span.set_attribute("error.type", type(error).__name__)
+                span.set_status(Status(StatusCode.ERROR, type(error).__name__))
 
             finally:
                 db.close()
+                span.set_attribute(
+                    "tool.latency_ms", (time.perf_counter() - start_time) * 1000
+                )
 
         executed_tools[action_key] = tool_result
 

@@ -65,6 +65,10 @@ def with_retries(
         try:
             return operation(), attempt + 1
         except Exception as error:
+            try:
+                error.retry_count = attempt + 1
+            except Exception:
+                pass
             if attempt + 1 >= attempts or not is_retryable_provider_error(error):
                 raise
             delay = min(base_delay_seconds * (2**attempt), 2.0)

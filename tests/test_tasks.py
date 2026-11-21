@@ -160,6 +160,23 @@ def test_conversation_can_be_renamed_and_deleted(client, monkeypatch):
     assert renamed.json()["title"] == "Planning"
     assert client.delete(f"/chat/conversations/{conversation_id}").status_code == 204
     assert client.get(f"/chat/conversations/{conversation_id}").status_code == 404
+    assert client.get("/chat/conversations").json() == []
+
+
+def test_conversation_delete_preserves_ownership(client):
+    from app.core.auth import get_current_user
+    from main import app
+
+    created = client.post("/chat/conversations")
+    conversation_id = created.json()["id"]
+    app.dependency_overrides[get_current_user] = lambda: {"id": "test-user-b"}
+    try:
+        assert (
+            client.delete(f"/chat/conversations/{conversation_id}").status_code == 404
+        )
+    finally:
+        app.dependency_overrides[get_current_user] = lambda: {"id": "test-user-a"}
+    assert client.get(f"/chat/conversations/{conversation_id}").status_code == 200
 
 
 def test_chat_persists_exchange_only_after_success(client, monkeypatch):
@@ -189,6 +206,23 @@ def test_failed_new_chat_leaves_no_orphan_conversation(client, monkeypatch):
     response = client.post("/chat/", json={"message": "Hello"})
     assert response.status_code == 503
     assert client.get("/chat/conversations").json() == []
+
+
+def test_deleting_conversation_removes_persisted_messages(client, monkeypatch):
+    from app.agent import workflow
+
+    monkeypatch.setattr(workflow, "run_agent", lambda **kwargs: "Persisted answer")
+    response = client.post("/chat/", json={"message": "Persist this exchange"})
+    conversation_id = response.json()["conversation_id"]
+    assert (
+        len(client.get(f"/chat/conversations/{conversation_id}").json()["messages"])
+        == 2
+    )
+
+    deleted = client.delete(f"/chat/conversations/{conversation_id}")
+
+    assert deleted.status_code == 204
+    assert client.get(f"/chat/conversations/{conversation_id}").status_code == 404
 
 
 def test_protected_api_requires_authentication(client):

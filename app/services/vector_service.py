@@ -128,6 +128,7 @@ def create_embedding(text: str, user_id: str | None = None) -> list[float]:
             span.set_attribute("ai.provider", route.provider)
             span.set_attribute("ai.model", route.model)
             span.set_attribute("cache.hit", True)
+            span.set_attribute("ai.latency_ms", 0.0)
         logger.info(
             "Embedding cache hit provider=%s model=%s", route.provider, route.model
         )
