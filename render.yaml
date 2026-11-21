@@ -4,7 +4,7 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
-    autoDeploy: false
+    autoDeployTrigger: checksPass
     envVars:
       - key: APP_ENVIRONMENT
         value: production
@@ -26,3 +26,31 @@ services:
         sync: false
       - key: CORS_ORIGINS
         sync: false
+      - key: DEFAULT_AI_PROVIDER
+        value: gemini
+      - key: AI_EMBEDDING_PROVIDER
+        value: gemini
+      - key: AI_FALLBACK_PROVIDERS
+        value: openrouter,groq
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash-lite
+      - key: GEMINI_EMBEDDING_MODEL
+        value: gemini-embedding-001
+      - key: OPENROUTER_MODEL
+        value: google/gemma-4-31b-it:free
+      - key: GROQ_MODEL
+        value: qwen/qwen3.8-27b
+      - key: DATABASE_POOL_SIZE
+        value: "5"
+      - key: DATABASE_MAX_OVERFLOW
+        value: "5"
+      - key: AI_TIMEOUT_SECONDS
+        value: "30"
+      - key: AI_RETRY_ATTEMPTS
+        value: "2"
+      - key: AI_RETRY_BASE_SECONDS
+        value: "0.35"
+      - key: AI_FAILURE_THRESHOLD
+        value: "3"
+      - key: AI_COOLDOWN_SECONDS
+        value: "60"

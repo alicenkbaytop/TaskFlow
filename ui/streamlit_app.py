@@ -5,6 +5,12 @@ import requests
 import streamlit as st
 from dotenv import dotenv_values
 
+from ui.chat_state import (
+    clear_chat_state,
+    initialize_chat_state,
+    mark_conversation_deleted,
+)
+
 _frontend_settings = dotenv_values(
     os.path.join(os.path.dirname(__file__), "..", ".env.frontend")
 )
@@ -581,6 +587,7 @@ def load_conversations() -> list[dict]:
 
 
 def render_assistant() -> None:
+    initialize_chat_state(st.session_state, st.query_params)
     st.markdown('<p class="eyebrow">AI assistant</p>', unsafe_allow_html=True)
     title_col, new_col = st.columns([5, 1])
     with title_col:
@@ -597,24 +604,29 @@ def render_assistant() -> None:
                 st.session_state.active_conversation_id = conversation["id"]
                 st.session_state.conversation_picker = conversation["id"]
                 st.session_state.chat_history = []
+                st.session_state.loaded_conversation_id = conversation["id"]
+                st.query_params["conversation_id"] = str(conversation["id"])
                 st.rerun()
             except requests.RequestException as error:
                 st.error(f"Could not create a conversation: {error}")
 
+    conversations_available = True
     try:
         conversations = load_conversations()
     except requests.RequestException as error:
         st.error(f"Could not load conversations: {error}")
         conversations = []
+        conversations_available = False
 
     conversation_by_id = {item["id"]: item for item in conversations}
     options = [None, *conversation_by_id]
     current = st.session_state.get("active_conversation_id")
-    if current not in options:
+    if conversations_available and current not in options:
+        clear_chat_state(st.session_state)
         current = None
-        st.session_state.active_conversation_id = None
+        st.query_params.pop("conversation_id", None)
 
-    if conversations:
+    if conversations_available and conversations:
         if st.session_state.get("conversation_picker") != current:
             st.session_state.conversation_picker = current
         selected = st.selectbox(
@@ -631,20 +643,31 @@ def render_assistant() -> None:
         )
         if selected != st.session_state.get("active_conversation_id"):
             st.session_state.active_conversation_id = selected
+            st.session_state.chat_history = []
+            st.session_state.loaded_conversation_id = None
             if selected is None:
-                st.session_state.chat_history = []
+                st.query_params.pop("conversation_id", None)
             else:
-                try:
-                    detail = api_request(
-                        "GET", f"/chat/conversations/{selected}"
-                    ).json()
-                    st.session_state.chat_history = detail["messages"]
-                except requests.RequestException as error:
-                    st.error(f"Could not load this conversation: {error}")
-                    st.session_state.chat_history = []
+                st.query_params["conversation_id"] = str(selected)
 
         active_id = st.session_state.get("active_conversation_id")
         if active_id is not None:
+            if st.session_state.get("loaded_conversation_id") != active_id:
+                try:
+                    detail = api_request(
+                        "GET", f"/chat/conversations/{active_id}"
+                    ).json()
+                    st.session_state.chat_history = detail["messages"]
+                    st.session_state.loaded_conversation_id = active_id
+                except requests.HTTPError as error:
+                    if error.response is not None and error.response.status_code == 404:
+                        clear_chat_state(st.session_state)
+                        st.query_params.pop("conversation_id", None)
+                        st.rerun()
+                    st.error(f"Could not load this conversation: {error}")
+                except requests.RequestException as error:
+                    st.error(f"Could not load this conversation: {error}")
+
             with st.expander("Conversation settings"):
                 active_title = conversation_by_id[active_id].get("title", "")
                 with st.form(f"rename_conversation_{active_id}"):
@@ -660,14 +683,19 @@ def render_assistant() -> None:
                         st.rerun()
                     except requests.RequestException as error:
                         st.error(f"Could not rename conversation: {error}")
+                confirmed = st.checkbox(
+                    "I understand this permanently deletes the conversation",
+                    key=f"confirm_delete_conversation_{active_id}",
+                )
                 if st.button(
-                    "Delete conversation", key=f"delete_conversation_{active_id}"
+                    "Delete conversation",
+                    key=f"delete_conversation_{active_id}",
+                    disabled=not confirmed,
                 ):
                     try:
                         api_request("DELETE", f"/chat/conversations/{active_id}")
-                        st.session_state.active_conversation_id = None
-                        st.session_state.conversation_picker = None
-                        st.session_state.chat_history = []
+                        mark_conversation_deleted(st.session_state, st.query_params)
+                        st.toast("Conversation deleted")
                         st.rerun()
                     except requests.RequestException as error:
                         st.error(f"Could not delete conversation: {error}")
@@ -687,13 +715,11 @@ def render_assistant() -> None:
             st.markdown(message["content"])
 
     prompt = st.chat_input("Message TaskFlow…")
-    if prompt:
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-        sent_ok = False
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        with st.chat_message("assistant"), st.spinner("Working through your request…"):
-            try:
+    if prompt and not st.session_state.get("chat_request_in_flight", False):
+        st.session_state.chat_request_in_flight = True
+        post_succeeded = False
+        try:
+            with st.spinner("Working through your request…"):
                 result = api_request(
                     "POST",
                     "/chat/",
@@ -705,28 +731,49 @@ def render_assistant() -> None:
                         ),
                     },
                 ).json()
-                st.session_state.active_conversation_id = result["conversation_id"]
-                st.markdown(result["answer"])
-                st.session_state.chat_history.append(
-                    {"role": "assistant", "content": result["answer"]}
+                post_succeeded = True
+                conversation_id = result["conversation_id"]
+                st.session_state.active_conversation_id = conversation_id
+                st.session_state.conversation_picker = conversation_id
+                st.session_state.chat_history = []
+                st.session_state.loaded_conversation_id = None
+                st.query_params["conversation_id"] = str(conversation_id)
+                detail = api_request(
+                    "GET", f"/chat/conversations/{conversation_id}"
+                ).json()
+                st.session_state.chat_history = detail["messages"]
+                st.session_state.loaded_conversation_id = conversation_id
+        except requests.HTTPError as error:
+            if post_succeeded:
+                st.error(
+                    "The reply was saved, but TaskFlow could not reload the "
+                    "conversation. It will reload from the server on your next visit."
                 )
-                sent_ok = True
-            except requests.HTTPError as error:
-                detail = (
-                    error.response.json().get("detail", "The request failed.")
-                    if error.response is not None
-                    else str(error)
+                return
+            detail = (
+                error.response.json().get("detail", "The request failed.")
+                if error.response is not None
+                else str(error)
+            )
+            st.error(f"The backend could not answer this request: {detail}")
+        except requests.RequestException as error:
+            if post_succeeded:
+                st.error(
+                    "The reply was saved, but TaskFlow could not reload the "
+                    "conversation. It will reload from the server on your next visit."
                 )
-                st.error(f"The backend could not answer this request: {detail}")
-            except requests.RequestException as error:
-                st.error(f"Could not connect to the AI assistant: {error}")
-        if sent_ok:
+                return
+            st.error(f"Could not connect to the AI assistant: {error}")
+        finally:
+            st.session_state.chat_request_in_flight = False
+        if st.session_state.get("loaded_conversation_id") == st.session_state.get(
+            "active_conversation_id"
+        ):
             st.rerun()
-        else:
-            st.session_state.chat_history.pop()
 
 
 def main() -> None:
+    initialize_chat_state(st.session_state, st.query_params)
     if not st.session_state.get("access_token"):
         show_authentication()
         return
@@ -767,6 +814,7 @@ def main() -> None:
                 "chat_history",
             ):
                 st.session_state.pop(key, None)
+            st.query_params.pop("conversation_id", None)
             st.rerun()
 
     if page == "AI Assistant":

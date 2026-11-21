@@ -11,8 +11,8 @@ uv run alembic upgrade head
 ```
 
 The current migration chain creates the base task/conversation/message/vector
-schema and RLS policies, removes only the retired transient Google OAuth state
-table, then adds chronological-message and HNSW cosine indexes, followed by an
+schema and RLS policies, preserves the unused legacy OAuth state table, then
+adds chronological-message and concurrent HNSW cosine indexes, followed by an
 activity timestamp/index for conversations. Migration 0004 builds an HNSW index
 over existing 768-dimensional embeddings; large datasets may require a planned
 maintenance window. Existing task, conversation,
@@ -61,12 +61,14 @@ semantic indexing/search may be unavailable until the provider recovers.
 
 ## Render API
 
-The repository includes a manual-deploy Render blueprint in `render.yaml`.
-Review service settings, then provide:
+The repository includes a Render blueprint in `render.yaml` configured to deploy
+after repository CI checks pass. Review service settings, then provide:
 
 - `DATABASE_URL`, `SUPABASE_URL`, and `SUPABASE_ANON_KEY`.
 - `GEMINI_API_KEY`; optionally `OPENROUTER_API_KEY` and `GROQ_API_KEY`.
 - `CORS_ORIGINS` with the exact Streamlit Community Cloud origin.
+- `APP_ENVIRONMENT=production`, `DEFAULT_AI_PROVIDER=gemini`,
+  `AI_EMBEDDING_PROVIDER=gemini`, and `AI_FALLBACK_PROVIDERS=openrouter,groq`.
 - Optional `PHOENIX_ENDPOINT` and `PHOENIX_API_KEY`.
 - Model routing, retry, pool, and timeout variables as needed.
 
@@ -74,10 +76,19 @@ The Docker entrypoint executes `alembic upgrade head` before Uvicorn starts.
 Render supplies the port; Uvicorn binds `0.0.0.0`. `/health` performs a simple
 database query. Production rejects SQLite. Read migration SQL and confirm
 `DATABASE_URL` points at the intended project before deploying. The migration
-will remove only the unused `oauth_states` table, add indexes, and add a
-conversation timestamp; it does not
-reset Supabase or drop user application data. No production migration was run
-in this workspace.
+chain does not drop or reset application data. Migration `0003` intentionally
+retains the legacy `oauth_states` table. Migration `0004` creates the HNSW index
+concurrently, avoiding a write-blocking build but still consuming resources and
+taking time on a large embedding table. Before
+enabling automatic deployment, inspect the target database's `alembic_version`
+and schema. A pre-existing schema without a matching Alembic revision needs a
+reviewed baseline; the initial migration is not idempotent. No production
+migration was run in this workspace.
+
+Render's blueprint uses `autoDeployTrigger: checksPass`, so configure GitHub
+checks for the connected repository. Protect `main` and require the `quality`
+CI job before merging. Automatic deployment does not replace review of database
+migration state.
 
 ## Streamlit Community Cloud
 
@@ -94,11 +105,46 @@ SUPABASE_URL = "https://<project-ref>.supabase.co"
 SUPABASE_ANON_KEY = "<public-anon-key>"
 ```
 
-Add that app's origin to Render `CORS_ORIGINS` and to Supabase Auth's allowed
-redirect/site URL configuration. Use the anon/publishable key only. Never add
+Connect Community Cloud to the intended repository and branch; it rebuilds the
+app when that branch changes. Add that app's origin to Render `CORS_ORIGINS` and
+to Supabase Auth's allowed redirect/site URL configuration. Use the
+anon/publishable key only. Never add
 model API keys, a database URL, or Supabase service-role key to Streamlit.
 
 ## Phoenix hosted receiver
+
+### Phoenix Cloud setup and verification
+
+1. Create a Phoenix Cloud Space and open its Settings page.
+2. Copy the Space **Hostname** as the collector endpoint, and create a system
+   API key in the Space settings. Store the key as a secret.
+3. On Render set `PHOENIX_ENDPOINT` to the HTTPS hostname (with or without
+   `/v1/traces`) and `PHOENIX_API_KEY` to the API key. TaskFlow appends
+   `/v1/traces` when needed and sends `authorization: Bearer <key>` over OTLP
+   HTTP.
+4. After deployment, sign in to TaskFlow, open AI Assistant, and send a real
+   request such as “What are my tasks?” A request that invokes a task tool
+   produces workflow/tool spans. This uses the configured model provider and
+   may consume its quota.
+5. In Phoenix, open the `taskflow` project. It is identified by the
+   `openinference.project.name` resource attribute and may appear after the
+   first trace arrives.
+6. Inspect FastAPI request spans, `langgraph.workflow`, `agent.llm_request`,
+   `ai.routing_decision`, `ai.routing_attempt`, `agent.tool_execution`,
+   `ai.embedding`, and `ai.retrieval`. Useful attributes include provider,
+   model, fallback, skipped-provider reason, attempt index, retry count,
+   success, latency, result count, HTTP status, and error type.
+
+Phoenix documents the Cloud collector hostname in its
+[endpoint FAQ](https://arize.com/docs/phoenix/learn/resources/faqs/what-is-my-phoenix-endpoint)
+and Bearer API key setup in its
+[authentication guide](https://arize.com/docs/phoenix/deployment/authentication).
+
+TaskFlow exports **traces only**. It does not configure an OpenTelemetry metrics
+pipeline, dashboards for request rates, token counts, estimated costs, or
+provider spend. Trace delivery has not been verified against a real Phoenix
+Cloud Space from this workspace. Exporter setup is optional and does not block
+API startup; batch export failures do not fail API requests.
 
 Deploy Phoenix separately (for example, on an existing managed container host)
 or use a hosted Phoenix project that accepts OTLP/HTTP. Do not set the backend
@@ -114,9 +160,8 @@ inspect spans named `agent.llm_request`, `ai.routing_attempt`,
 FastAPI request spans. Provider, model, fallback, status, and latency attributes
 are intended for operations. Prompt content and credentials are not attached.
 
-TaskFlow treats tracing as optional and exporter errors do not stop API startup.
-Delivery is unverified until the hosted receiver and access credentials are
-available; there is no configured production Phoenix URL in this repository.
+TaskFlow treats tracing as optional. There is no configured production Phoenix
+URL in this repository.
 
 ## Local checks
 

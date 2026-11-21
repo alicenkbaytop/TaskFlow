@@ -106,7 +106,7 @@ ui/              Streamlit application entry point
 docs/            Operations, provider, and deployment notes
 main.py          FastAPI app
 Dockerfile       Render-compatible backend container
-render.yaml      Render service blueprint (manual deploy)
+render.yaml      Render service blueprint (deploy after CI checks pass)
 requirements.txt Streamlit Community Cloud frontend dependencies
 ```
 
@@ -154,6 +154,7 @@ project values.
 | `DATABASE_URL` | Backend | PostgreSQL/pgvector connection string with TLS |
 | `DATABASE_POOL_SIZE`, `DATABASE_MAX_OVERFLOW` | Backend | SQLAlchemy pool limits |
 | `SUPABASE_URL`, `SUPABASE_ANON_KEY` | Backend and UI | Validate sessions and use email/password Auth |
+| `AI_EMBEDDING_PROVIDER` | Backend | Keep vector embeddings on Gemini |
 | `DEFAULT_AI_PROVIDER` | Backend | Defaults to `gemini` |
 | `AI_CHAT_PROVIDER` | Backend | Optional provider override for chat |
 | `AI_COMPLEX_PROVIDER`, `AI_IMPORTANT_PROVIDER` | Backend | Optional task classification preferences |
@@ -176,9 +177,9 @@ from that validated identity, never from a client-supplied owner field. The
 Alembic schema enables RLS for user records and creates pgvector storage and
 indexes. The app also enforces ownership in its SQLAlchemy service layer.
 
-Migration `0003` drops only `oauth_states`, a short-lived PKCE table used by
-retired Google sign-in; it does not drop tasks, conversations, messages, or
-migration `0004` adds message-order and vector-search indexes; `0005` adds a
+Migration `0003` is intentionally non-destructive and leaves the legacy
+`oauth_states` table untouched; it is no longer used by the application.
+Migration `0004` adds message-order and concurrent vector-search indexes; `0005` adds a
 conversation activity timestamp and owner/activity index. Review
 migrations against the target database before running them. No production
 database was accessed or modified during this work.
@@ -227,13 +228,16 @@ for exact manual setup.
 - **Render backend:** use the `render.yaml` blueprint or configure the Docker
   web service manually. Set the environment values in Render; the container
   binds `0.0.0.0:$PORT`, applies Alembic migrations, and exposes `/health`.
-  `autoDeploy` is disabled in the blueprint.
+  The blueprint deploys automatically only after configured checks pass.
 - **Streamlit Community Cloud:** deploy `ui/streamlit_app.py`. Configure
   `TASKFLOW_API_URL`, `SUPABASE_URL`, and `SUPABASE_ANON_KEY` in its Secrets page.
   Set `TASKFLOW_API_URL` to the public Render API URL, never `localhost`.
 - **Supabase:** use the PostgreSQL pooler URL with TLS, enable pgvector, and
   configure Auth email/password settings and allowed frontend URLs.
 - **CORS:** set `CORS_ORIGINS` on Render to the exact Streamlit app origin(s).
+- **GitHub:** protect `main` and require the `quality` CI job before merging.
+- **Streamlit Community Cloud:** connect the repository and deployment branch;
+  it rebuilds the app when that branch changes. Keep frontend secrets separate.
 
 ## Future work
 

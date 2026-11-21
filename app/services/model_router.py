@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 
 from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 
 from app.core.config import get_settings
 
@@ -179,9 +180,22 @@ def generate_with_fallback(operation, *, routes: list[ModelRoute] | None = None)
 
     previous_attempt = None
     for index, route in enumerate(routes):
+
+        def record_skip(reason: str) -> None:
+            with tracer.start_as_current_span("ai.routing_attempt") as span:
+                span.set_attribute("ai.operation", route.operation)
+                span.set_attribute("ai.provider", route.provider)
+                span.set_attribute("ai.model", route.model)
+                span.set_attribute("ai.attempt_index", index + 1)
+                span.set_attribute("ai.fallback", index > 0)
+                span.set_attribute("ai.skipped", True)
+                span.set_attribute("ai.skip_reason", reason)
+
         if not provider_available(route.provider):
+            record_skip("provider_cooldown")
             continue
         if route.operation == "embedding" and route.provider != "gemini":
+            record_skip("embedding_provider_pinned")
             last_error = RuntimeError("TaskFlow embeddings are pinned to Gemini")
             continue
         capabilities = model_capabilities(route)
@@ -189,12 +203,14 @@ def generate_with_fallback(operation, *, routes: list[ModelRoute] | None = None)
             route.operation == "chat" and not capabilities["tool_calling"]
         ) or (route.operation == "evaluation" and not capabilities["json_mode"])
         if unsupported:
+            record_skip("required_capability_unavailable")
             last_error = RuntimeError(
                 f"Configured {route.provider} model lacks the required "
                 f"capability for {route.operation}"
             )
             continue
         if not provider_is_configured(route):
+            record_skip("missing_provider_key")
             last_error = RuntimeError(
                 f"{route.provider.upper()}_API_KEY is not configured"
             )
@@ -204,20 +220,29 @@ def generate_with_fallback(operation, *, routes: list[ModelRoute] | None = None)
             span.set_attribute("ai.operation", route.operation)
             span.set_attribute("ai.provider", route.provider)
             span.set_attribute("ai.model", route.model)
+            span.set_attribute("ai.attempt_index", index + 1)
             span.set_attribute("ai.fallback", index > 0)
             try:
                 result = operation(route)
                 record_provider_result(route.provider, True)
                 span.set_attribute("ai.success", True)
+                if (
+                    isinstance(result, tuple)
+                    and len(result) == 2
+                    and isinstance(result[1], int)
+                ):
+                    span.set_attribute("ai.retry_count", max(0, result[1] - 1))
                 span.set_attribute(
                     "ai.latency_ms", (time.perf_counter() - attempt_start) * 1000
                 )
+                span.set_attribute("ai.fallback_used", index > 0)
                 if previous_attempt:
                     span.set_attribute("ai.fallback_from", previous_attempt)
                 return result, route
             except Exception as error:
                 span.set_attribute("ai.success", False)
                 span.set_attribute("error.type", type(error).__name__)
+                span.set_attribute("ai.retry_count", getattr(error, "retry_count", 0))
                 status = getattr(error, "status_code", None) or getattr(
                     error, "code", None
                 )
@@ -225,6 +250,8 @@ def generate_with_fallback(operation, *, routes: list[ModelRoute] | None = None)
                 span.set_attribute(
                     "ai.latency_ms", (time.perf_counter() - attempt_start) * 1000
                 )
+                span.set_attribute("ai.retryable", is_fallback_eligible(error))
+                span.set_status(Status(StatusCode.ERROR, type(error).__name__))
                 last_error = error
                 previous_attempt = route.provider
                 if is_fallback_eligible(error):
