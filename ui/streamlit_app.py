@@ -3,7 +3,6 @@ from datetime import date
 
 import requests
 import streamlit as st
-
 from chat_state import (
     clear_chat_state,
     initialize_chat_state,
