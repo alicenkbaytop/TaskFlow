@@ -5,7 +5,7 @@ import requests
 import streamlit as st
 from dotenv import dotenv_values
 
-from ui.chat_state import (
+from chat_state import (
     clear_chat_state,
     initialize_chat_state,
     mark_conversation_deleted,
