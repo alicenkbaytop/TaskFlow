@@ -3,13 +3,12 @@ from datetime import date
 
 import requests
 import streamlit as st
-from dotenv import dotenv_values
-
-from ui.chat_state import (
+from chat_state import (
     clear_chat_state,
     initialize_chat_state,
     mark_conversation_deleted,
 )
+from dotenv import dotenv_values
 
 _frontend_settings = dotenv_values(
     os.path.join(os.path.dirname(__file__), "..", ".env.frontend")
