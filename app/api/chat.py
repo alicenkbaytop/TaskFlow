@@ -32,11 +32,13 @@ class ConversationSummary(BaseModel):
     id: int
     title: str
     created_at: datetime
+    updated_at: datetime
 
 
 class MessageResponse(BaseModel):
     role: str
     content: str
+    created_at: datetime
 
 
 class ConversationDetail(BaseModel):
@@ -44,6 +46,20 @@ class ConversationDetail(BaseModel):
     title: str
     created_at: datetime
     messages: list[MessageResponse]
+
+
+class ConversationRename(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
+@router.post("/conversations", response_model=ConversationSummary, status_code=201)
+@limiter.limit("60/minute")
+def start_conversation(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    return create_conversation(db, user["id"])
 
 
 @router.post("/", response_model=ChatResponse)
@@ -54,6 +70,7 @@ def chat(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    is_new = body.conversation_id is None
     conversation = (
         get_conversation(db, user["id"], body.conversation_id)
         if body.conversation_id is not None
@@ -61,7 +78,21 @@ def chat(
     )
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    answer = ask_gemini(db, user["id"], conversation.id, body.message)
+    try:
+        answer = ask_gemini(db, user["id"], conversation.id, body.message)
+    except Exception as error:
+        db.rollback()
+        if is_new:
+            db.delete(conversation)
+            db.commit()
+        from app.agent.workflow import AIWorkflowError
+
+        if isinstance(error, AIWorkflowError):
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        raise
+    if conversation.title == "New conversation":
+        conversation.title = body.message.strip()[:60] or "New conversation"
+        db.commit()
 
     return ChatResponse(answer=answer, conversation_id=conversation.id)
 
@@ -107,5 +138,39 @@ def retrieve_conversation(
         "id": conversation.id,
         "title": conversation.title,
         "created_at": conversation.created_at,
+        "updated_at": conversation.updated_at,
         "messages": messages,
     }
+
+
+@router.patch("/conversations/{conversation_id}", response_model=ConversationSummary)
+@limiter.limit("60/minute")
+def rename_conversation(
+    conversation_id: int,
+    body: ConversationRename,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    conversation = get_conversation(db, user["id"], conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    conversation.title = body.title.strip()
+    db.commit()
+    db.refresh(conversation)
+    return conversation
+
+
+@router.delete("/conversations/{conversation_id}", status_code=204)
+@limiter.limit("60/minute")
+def delete_conversation(
+    conversation_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    conversation = get_conversation(db, user["id"], conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    db.delete(conversation)
+    db.commit()

@@ -10,7 +10,9 @@ from app.services import vector_service
 
 
 def test_embedding_sync_and_removal_without_live_gemini(monkeypatch):
-    monkeypatch.setattr(vector_service, "create_embedding", lambda text: [0.1] * 768)
+    monkeypatch.setattr(
+        vector_service, "create_embedding", lambda text, **kwargs: [0.1] * 768
+    )
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -39,7 +41,9 @@ def test_semantic_search_requires_postgresql():
 
 
 def test_semantic_query_scopes_by_owner(monkeypatch):
-    monkeypatch.setattr(vector_service, "create_embedding", lambda text: [0.1] * 768)
+    monkeypatch.setattr(
+        vector_service, "create_embedding", lambda text, **kwargs: [0.1] * 768
+    )
     embedding = TaskEmbedding(
         task_id=9, user_id="user-a", content="task", embedding=[0.1] * 768
     )

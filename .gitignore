@@ -9,11 +9,15 @@ wheels/
 # Virtual environments
 .venv
 .env
+.env.*
+!.env.example
+!.env.frontend.example
 .venv/
 
 
 *.db
 qdrant_data/
+.streamlit/secrets.toml
 
 .pytest_cache/
 .ruff_cache/

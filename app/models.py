@@ -1,7 +1,16 @@
 from datetime import UTC, date, datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import JSON, Date, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import (
+    JSON,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -35,11 +44,15 @@ class Task(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
         onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
     )
 
 
 class Conversation(Base):
     __tablename__ = "conversations"
+    __table_args__ = (
+        Index("ix_conversations_user_updated", "user_id", "updated_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
 
@@ -55,6 +68,12 @@ class Conversation(Base):
         default=lambda: datetime.now(UTC),
     )
 
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
     # One conversation can contain multiple messages.
     messages: Mapped[list["Message"]] = relationship(
         back_populates="conversation",
@@ -65,11 +84,12 @@ class Conversation(Base):
 
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (Index("ix_messages_conversation_id_id", "conversation_id", "id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
 
     conversation_id: Mapped[int] = mapped_column(
-        ForeignKey("conversations.id"),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
     )
 
     role: Mapped[str] = mapped_column(String(20))
@@ -89,7 +109,15 @@ class Message(Base):
 
 class TaskEmbedding(Base):
     __tablename__ = "task_embeddings"
-    __table_args__ = (Index("ix_task_embeddings_user_id", "user_id"),)
+    __table_args__ = (
+        Index("ix_task_embeddings_user_id", "user_id"),
+        Index(
+            "ix_task_embeddings_vector_cosine",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
 
     task_id: Mapped[int] = mapped_column(
         ForeignKey("tasks.id", ondelete="CASCADE"), primary_key=True

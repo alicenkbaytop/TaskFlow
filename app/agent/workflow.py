@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import time
@@ -6,15 +7,21 @@ from langgraph.graph import END, START, StateGraph
 from opentelemetry import trace
 
 from app.agent.state import AgentState
+from app.core.config import get_settings
 from app.database import SessionLocal
 from app.services.llm_service import (
-    AI_PROVIDER,
-    MODEL_NAME,
     execute_tool,
-    generate_gemini_message,
-    get_llm_client,
+    generate_chat_message,
     tools,
 )
+from app.services.model_router import (
+    generate_with_fallback,
+    provider_order,
+    resolve_route,
+    route_for_task,
+    task_importance,
+)
+from app.services.provider_reliability import with_retries
 
 logger = logging.getLogger(__name__)
 
@@ -23,45 +30,57 @@ tracer = trace.get_tracer(__name__)
 MAX_TOOL_ROUNDS = 5
 
 
+class AIWorkflowError(RuntimeError):
+    """Controlled AI provider failure safe to return to an authenticated user."""
+
+
 # -------------------------
 # Agent Node
 # -------------------------
 
 
 def agent_node(state: AgentState):
-
     start_time = time.perf_counter()
+    settings = get_settings()
+    latest_user_message = next(
+        (
+            message.get("content", "")
+            for message in reversed(state["messages"])
+            if message.get("role") == "user"
+        ),
+        "",
+    )
+    if state.get("active_provider"):
+        route = resolve_route("chat", state["active_provider"])
+        importance = task_importance(latest_user_message)
+    else:
+        route, importance = route_for_task(latest_user_message)
+    retry_count = 0
+    assistant_message = None
 
     with tracer.start_as_current_span("agent.llm_request") as span:
-        span.set_attribute("llm.model", MODEL_NAME)
+        span.set_attribute("llm.provider", route.provider)
+        span.set_attribute("llm.model", route.model)
+        span.set_attribute("ai.task_importance", importance)
 
         try:
-            if AI_PROVIDER == "gemini":
-                assistant_message = generate_gemini_message(
-                    state["messages"], tools
-                )
-            else:
-                response = get_llm_client().chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=state["messages"],
-                    tools=tools,
-                )
-                choice = response.choices[0].message
-                assistant_message = {
-                    "content": choice.content or "",
-                    "tool_calls": [
-                        {
-                            "id": call.id,
-                            "type": "function",
-                            "function": {
-                                "name": call.function.name,
-                                "arguments": call.function.arguments,
-                            },
-                        }
-                        for call in (choice.tool_calls or [])
-                    ],
-                }
+            routes = provider_order("chat", route.provider)
+            result, actual_route = generate_with_fallback(
+                lambda candidate: with_retries(
+                    lambda: generate_chat_message(candidate, state["messages"], tools),
+                    attempts=settings.ai_retry_attempts,
+                    base_delay_seconds=settings.ai_retry_base_seconds,
+                ),
+                routes=routes,
+            )
+            assistant_message, retry_count = result
+            route = actual_route
+
+            duration = (time.perf_counter() - start_time) * 1000
             span.set_attribute("llm.success", True)
+            span.set_attribute("llm.provider", route.provider)
+            span.set_attribute("llm.model", route.model)
+            span.set_attribute("llm.retry_count", retry_count - 1)
 
         except Exception as error:
             span.set_attribute("llm.success", False)
@@ -71,27 +90,26 @@ def agent_node(state: AgentState):
             )
             logger.error(
                 "AI request failed: provider=%s model=%s type=%s status=%s",
-                AI_PROVIDER,
-                MODEL_NAME,
+                route.provider,
+                route.model,
                 type(error).__name__,
                 status_code,
             )
-
             error_type = type(error).__name__
             if error_type == "AuthenticationError" or status_code in (401, 403):
-                answer = f"The {AI_PROVIDER} provider rejected its credentials."
+                answer = f"The {route.provider} provider rejected its credentials."
             elif error_type == "RateLimitError" or status_code == 429:
-                answer = f"The {AI_PROVIDER} provider rate limit was reached."
+                answer = f"The {route.provider} provider rate limit was reached."
             elif "Timeout" in error_type or status_code == 504:
                 answer = "The AI provider did not respond in time. Please try again."
             elif error_type == "APIConnectionError":
                 answer = (
                     "TaskFlow could not connect to the AI provider. "
-                    "Check that Ollama is running or verify the Gemini connection."
+                    "Check the configured AI provider credentials and network."
                 )
             elif status_code == 404:
                 answer = (
-                    f"AI model '{MODEL_NAME}' is unavailable. "
+                    f"AI model '{route.model}' is unavailable. "
                     "Check the selected provider and model setting."
                 )
             elif status_code == 503:
@@ -101,6 +119,10 @@ def agent_node(state: AgentState):
                 )
             elif isinstance(error, RuntimeError) and "GEMINI_API_KEY" in str(error):
                 answer = "GEMINI_API_KEY is not configured in the backend environment."
+            elif isinstance(error, RuntimeError) and "API_KEY is not configured" in str(
+                error
+            ):
+                answer = str(error)
             elif isinstance(error, RuntimeError):
                 answer = str(error)
             else:
@@ -108,14 +130,12 @@ def agent_node(state: AgentState):
                     "The AI provider could not complete the request. "
                     "Check the FastAPI logs for the provider error."
                 )
-            return {"answer": answer}
-
-    duration = (time.perf_counter() - start_time) * 1000
+            return {"answer": answer, "failed": True, "error_message": answer}
 
     logger.info(
         "AI provider: %s | model: %s | Duration: %.2f ms",
-        AI_PROVIDER,
-        MODEL_NAME,
+        route.provider,
+        route.model,
         duration,
     )
 
@@ -138,6 +158,7 @@ def agent_node(state: AgentState):
     if tool_calls and state["tool_rounds"] >= MAX_TOOL_ROUNDS:
         return {
             "messages": updated_messages,
+            "active_provider": route.provider,
             "answer": (
                 "I couldn't complete the request within the allowed tool-call limit."
             ),
@@ -147,6 +168,7 @@ def agent_node(state: AgentState):
     if not tool_calls:
         return {
             "messages": updated_messages,
+            "active_provider": route.provider,
             "answer": assistant_message.get("content", ""),
         }
 
@@ -166,6 +188,7 @@ def tool_node(state: AgentState):
     assistant_message = messages[-1]
 
     tool_calls = assistant_message.get("tool_calls", [])
+    executed_tools = dict(state.get("executed_tools", {}))
 
     for tool_call in tool_calls:
         function = tool_call["function"]
@@ -175,6 +198,30 @@ def tool_node(state: AgentState):
             arguments = json.loads(function["arguments"])
         except (TypeError, json.JSONDecodeError):
             arguments = None
+
+        action_key = hashlib.sha256(
+            json.dumps(
+                {"tool": tool_name, "arguments": arguments},
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        if action_key in executed_tools:
+            tool_result = executed_tools[action_key]
+            with tracer.start_as_current_span("agent.tool_deduplicated") as span:
+                span.set_attribute("tool.name", tool_name)
+                span.set_attribute("tool.deduplicated", True)
+                span.set_attribute("tool.success", "error" not in tool_result)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": json.dumps(tool_result, default=str),
+                }
+            )
+            continue
 
         start_time = time.perf_counter()
         with tracer.start_as_current_span("agent.tool_execution") as span:
@@ -192,7 +239,7 @@ def tool_node(state: AgentState):
                 if arguments is None:
                     tool_result = {"error": "Invalid tool arguments"}
 
-                span.set_attribute("tool.success", True)
+                span.set_attribute("tool.success", "error" not in tool_result)
 
             except Exception as error:
                 tool_result = {"error": "Tool execution failed", "tool": tool_name}
@@ -202,6 +249,8 @@ def tool_node(state: AgentState):
 
             finally:
                 db.close()
+
+        executed_tools[action_key] = tool_result
 
         duration = (time.perf_counter() - start_time) * 1000
 
@@ -222,6 +271,7 @@ def tool_node(state: AgentState):
     return {
         "messages": messages,
         "tool_rounds": state["tool_rounds"] + 1,
+        "executed_tools": executed_tools,
     }
 
 
@@ -286,15 +336,33 @@ def run_agent(
         "messages": messages,
         "answer": "",
         "tool_rounds": 0,
+        "failed": False,
+        "error_message": "",
+        "active_provider": None,
+        "executed_tools": {},
     }
 
     try:
-        result = agent_graph.invoke(
-            initial_state,
-            config={"recursion_limit": 20},
-        )
+        with tracer.start_as_current_span("langgraph.workflow") as span:
+            start = time.perf_counter()
+            result = agent_graph.invoke(
+                initial_state,
+                config={"recursion_limit": 20},
+            )
+            span.set_attribute("langgraph.success", not result.get("failed", False))
+            span.set_attribute("langgraph.tool_rounds", result.get("tool_rounds", 0))
+            span.set_attribute(
+                "langgraph.latency_ms", (time.perf_counter() - start) * 1000
+            )
 
+        if result.get("failed"):
+            raise AIWorkflowError(result.get("error_message") or "AI request failed")
         return result["answer"]
 
-    except Exception:
-        return "The AI workflow encountered an unexpected error. Please try again."
+    except AIWorkflowError:
+        raise
+    except Exception as error:
+        logger.error("AI workflow failed: %s", type(error).__name__)
+        raise AIWorkflowError(
+            "The AI workflow encountered an unexpected error."
+        ) from error

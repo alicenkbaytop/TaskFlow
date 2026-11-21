@@ -6,3 +6,5 @@ __pycache__
 *.db
 qdrant_data
 .env
+.env.*
+.streamlit/secrets.toml

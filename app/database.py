@@ -11,7 +11,19 @@ elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
+pool_options = (
+    {}
+    if DATABASE_URL.startswith("sqlite")
+    else {
+        "pool_size": get_settings().database_pool_size,
+        "max_overflow": get_settings().database_max_overflow,
+        "pool_timeout": 30,
+        "pool_recycle": 1800,
+    }
+)
+engine = create_engine(
+    DATABASE_URL, connect_args=connect_args, pool_pre_ping=True, **pool_options
+)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 

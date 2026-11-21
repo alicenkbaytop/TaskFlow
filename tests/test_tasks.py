@@ -142,6 +142,55 @@ def test_chat_conversations_are_user_scoped(client, monkeypatch):
         app.dependency_overrides[get_current_user] = lambda: {"id": "test-user-a"}
 
 
+def test_conversation_can_be_renamed_and_deleted(client, monkeypatch):
+    from app.api import chat as chat_api
+
+    monkeypatch.setattr(chat_api, "ask_gemini", lambda *args: "Hello")
+    created = client.post("/chat/conversations")
+    assert created.status_code == 201
+    conversation_id = created.json()["id"]
+    detail = client.get(f"/chat/conversations/{conversation_id}").json()
+    assert detail["title"] == "New conversation"
+    assert [message["role"] for message in detail["messages"]] == []
+
+    renamed = client.patch(
+        f"/chat/conversations/{conversation_id}", json={"title": "Planning"}
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["title"] == "Planning"
+    assert client.delete(f"/chat/conversations/{conversation_id}").status_code == 204
+    assert client.get(f"/chat/conversations/{conversation_id}").status_code == 404
+
+
+def test_chat_persists_exchange_only_after_success(client, monkeypatch):
+    from app.agent import workflow
+
+    monkeypatch.setattr(workflow, "run_agent", lambda **kwargs: "Your tasks are ready.")
+    response = client.post("/chat/", json={"message": "What are my tasks?"})
+    assert response.status_code == 200
+    conversation_id = response.json()["conversation_id"]
+    detail = client.get(f"/chat/conversations/{conversation_id}").json()
+    assert [message["role"] for message in detail["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    assert detail["messages"][0]["content"] == "What are my tasks?"
+    assert detail["messages"][1]["content"] == "Your tasks are ready."
+    assert detail["messages"][0]["created_at"] <= detail["messages"][1]["created_at"]
+
+
+def test_failed_new_chat_leaves_no_orphan_conversation(client, monkeypatch):
+    from app.agent import workflow
+
+    def fail(**kwargs):
+        raise workflow.AIWorkflowError("The AI provider timed out.")
+
+    monkeypatch.setattr(workflow, "run_agent", fail)
+    response = client.post("/chat/", json={"message": "Hello"})
+    assert response.status_code == 503
+    assert client.get("/chat/conversations").json() == []
+
+
 def test_protected_api_requires_authentication(client):
     from app.core.auth import get_current_user
     from main import app
