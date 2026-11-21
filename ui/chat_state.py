@@ -21,13 +21,26 @@ def initialize_chat_state(state, query_params=None) -> None:
         except (TypeError, ValueError):
             state["active_conversation_id"] = None
 
+    apply_pending_conversation_selection(state)
+
+
+def apply_pending_conversation_selection(state) -> None:
+    """Apply widget-key changes before the conversation picker is rendered."""
+    if "pending_conversation_id" in state:
+        state["conversation_picker"] = state.pop("pending_conversation_id")
+
+
+def schedule_conversation_selection(state, conversation_id: int | None) -> None:
+    """Defer selection changes until before the next picker instantiation."""
+    state["pending_conversation_id"] = conversation_id
+
 
 def clear_chat_state(state) -> None:
     """Clear the transient transcript and active conversation selection."""
     state["active_conversation_id"] = None
     state["chat_history"] = []
     state["loaded_conversation_id"] = None
-    state["conversation_picker"] = None
+    schedule_conversation_selection(state, None)
     state["chat_request_in_flight"] = False
 
 

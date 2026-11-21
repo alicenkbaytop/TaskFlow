@@ -4,9 +4,11 @@ from datetime import date
 import requests
 import streamlit as st
 from chat_state import (
+    apply_pending_conversation_selection,
     clear_chat_state,
     initialize_chat_state,
     mark_conversation_deleted,
+    schedule_conversation_selection,
 )
 from dotenv import dotenv_values
 
@@ -601,7 +603,7 @@ def render_assistant() -> None:
             try:
                 conversation = api_request("POST", "/chat/conversations").json()
                 st.session_state.active_conversation_id = conversation["id"]
-                st.session_state.conversation_picker = conversation["id"]
+                schedule_conversation_selection(st.session_state, conversation["id"])
                 st.session_state.chat_history = []
                 st.session_state.loaded_conversation_id = conversation["id"]
                 st.query_params["conversation_id"] = str(conversation["id"])
@@ -627,7 +629,8 @@ def render_assistant() -> None:
 
     if conversations_available and conversations:
         if st.session_state.get("conversation_picker") != current:
-            st.session_state.conversation_picker = current
+            schedule_conversation_selection(st.session_state, current)
+        apply_pending_conversation_selection(st.session_state)
         selected = st.selectbox(
             "Conversation history",
             options,
@@ -733,7 +736,7 @@ def render_assistant() -> None:
                 post_succeeded = True
                 conversation_id = result["conversation_id"]
                 st.session_state.active_conversation_id = conversation_id
-                st.session_state.conversation_picker = conversation_id
+                schedule_conversation_selection(st.session_state, conversation_id)
                 st.session_state.chat_history = []
                 st.session_state.loaded_conversation_id = None
                 st.query_params["conversation_id"] = str(conversation_id)
