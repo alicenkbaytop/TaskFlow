@@ -3,6 +3,7 @@ from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.agent.tools import (
@@ -16,16 +17,11 @@ from app.agent.tools import (
     update_task_tool,
 )
 from app.core.config import get_settings
+from app.models import Conversation, Message
 from app.schemas import TaskUpdate
-from app.services.conversation_service import (
-    get_conversation_history,
-    save_message,
-)
-from app.services.model_router import resolve_route
+from app.services.conversation_service import get_conversation_history
+from app.services.model_router import model_capabilities, resolve_route
 
-CHAT_ROUTE = resolve_route("chat")
-AI_PROVIDER = CHAT_ROUTE.provider
-MODEL_NAME = CHAT_ROUTE.model
 MAX_ROUNDS = 5
 MAX_PREVIOUS_MESSAGES = 10
 
@@ -35,14 +31,23 @@ def get_llm_client(provider: str | None = None):
 
     settings = get_settings()
     provider = provider or resolve_route("chat").provider
-    if provider == "ollama":
-        return OpenAI(
-            api_key="ollama",
-            base_url=f"{settings.ollama_base_url.rstrip('/')}/",
-            timeout=settings.ai_timeout_seconds,
-            max_retries=0,
+    endpoints = {
+        "openrouter": (settings.openrouter_api_key, "https://openrouter.ai/api/v1"),
+        "groq": (settings.groq_api_key, "https://api.groq.com/openai/v1"),
+    }
+    if provider not in endpoints:
+        raise RuntimeError(
+            f"Provider {provider} does not use the OpenAI-compatible API"
         )
-    raise RuntimeError("OpenAI-compatible client is only used with Ollama")
+    api_key, base_url = endpoints[provider]
+    if not api_key:
+        raise RuntimeError(f"{provider.upper()}_API_KEY is not configured")
+    return OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=settings.ai_timeout_seconds,
+        max_retries=0,
+    )
 
 
 def get_gemini_client():
@@ -62,7 +67,10 @@ def get_gemini_client():
 
 
 def generate_gemini_message(
-    messages: list[dict], function_tools: list[dict], model: str | None = None
+    messages: list[dict],
+    function_tools: list[dict],
+    model: str | None = None,
+    response_schema: dict | None = None,
 ):
     import uuid
 
@@ -150,6 +158,8 @@ def generate_gemini_message(
             [types.Tool(function_declarations=declarations)] if declarations else None
         ),
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        response_mime_type="application/json" if response_schema else None,
+        response_json_schema=response_schema,
     )
     response = client.models.generate_content(
         model=model or resolve_route("chat").model,
@@ -189,15 +199,59 @@ def generate_gemini_message(
     }
 
 
-def generate_chat_message(route, messages: list[dict], function_tools: list[dict]):
+def generate_chat_message(
+    route,
+    messages: list[dict],
+    function_tools: list[dict],
+    response_schema: dict | None = None,
+):
+    context_limit = model_capabilities(route)["context_tokens"]
+    if context_limit:
+        approximate_input_tokens = (
+            len(
+                json.dumps({"messages": messages, "tools": function_tools}, default=str)
+            )
+            + 3
+        ) // 4
+        if approximate_input_tokens > int(context_limit * 0.9):
+            error = ValueError(
+                f"Request exceeds the configured context budget for {route.model}"
+            )
+            error.status_code = 400
+            raise error
     if route.provider == "gemini":
-        return generate_gemini_message(messages, function_tools, model=route.model)
-    if route.provider == "ollama":
-        response = get_llm_client(provider=route.provider).chat.completions.create(
+        return generate_gemini_message(
+            messages,
+            function_tools,
             model=route.model,
-            messages=messages,
-            tools=function_tools,
+            response_schema=response_schema,
         )
+    if route.provider in {"openrouter", "groq"}:
+        client = get_llm_client(provider=route.provider)
+        messages = [
+            {key: value for key, value in message.items() if key != "_gemini_content"}
+            for message in messages
+        ]
+        request = {"model": route.model, "messages": messages}
+        if function_tools:
+            request["tools"] = function_tools
+            request["tool_choice"] = "auto"
+        if response_schema:
+            request["response_format"] = (
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "taskflow_evaluation",
+                        "strict": True,
+                        "schema": response_schema,
+                    },
+                }
+                if model_capabilities(route)["json_schema"]
+                else {"type": "json_object"}
+            )
+        if route.provider == "openrouter":
+            request["extra_headers"] = {"X-Title": "TaskFlow"}
+        response = client.chat.completions.create(**request)
         choice = response.choices[0].message
         return {
             "content": choice.content or "",
@@ -544,14 +598,6 @@ def ask_gemini(
     # Keep only the 10 most recent previous messages
     history = history[-MAX_PREVIOUS_MESSAGES:]
 
-    # Save the new user message to PostgreSQL.
-    save_message(
-        db=db,
-        conversation_id=conversation_id,
-        role="user",
-        content=user_message,
-    )
-
     # Prepare the initial agent context
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -559,19 +605,25 @@ def ask_gemini(
         {"role": "user", "content": user_message},
     ]
 
-    # Execute the LangGraph workflow
+    # Execute generation and task tools first. Persist the exchange only after a
+    # final answer exists so provider failure cannot leave orphan user turns.
     answer = run_agent(
         conversation_id=conversation_id,
         user_id=user_id,
         messages=messages,
     )
 
-    # Save the final assistant response
-    save_message(
-        db=db,
-        conversation_id=conversation_id,
-        role="assistant",
-        content=answer,
+    db.add_all(
+        [
+            Message(conversation_id=conversation_id, role="user", content=user_message),
+            Message(conversation_id=conversation_id, role="assistant", content=answer),
+        ]
     )
+    db.execute(
+        update(Conversation)
+        .where(Conversation.id == conversation_id)
+        .values(updated_at=func.now())
+    )
+    db.commit()
 
     return answer

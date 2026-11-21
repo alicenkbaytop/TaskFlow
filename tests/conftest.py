@@ -12,7 +12,7 @@ from main import app
 
 @pytest.fixture(autouse=True)
 def disable_live_embedding_calls(monkeypatch):
-    # CRUD tests must not call Ollama or Gemini, even when configured in .env.
+    # CRUD tests must never make live provider calls, even when keys exist in .env.
     monkeypatch.setattr(
         "app.services.task_service.embedding_provider_configured",
         lambda: False,

@@ -7,3 +7,7 @@ class AgentState(TypedDict):
     messages: list[dict[str, Any]]
     answer: str
     tool_rounds: int
+    failed: bool
+    error_message: str
+    active_provider: str | None
+    executed_tools: dict[str, Any]

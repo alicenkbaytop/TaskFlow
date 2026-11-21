@@ -1,264 +1,244 @@
 # TaskFlow
 
-TaskFlow is a task manager with a conversational AI assistant. It combines a
-Streamlit workspace with a FastAPI backend, Supabase authentication, and
-PostgreSQL-backed task and conversation data.
-
-## Project overview
-
-TaskFlow helps an individual organize work, keep track of deadlines, and update
-tasks through a normal conversation. The assistant can use validated task tools
-to list, create, inspect, update, complete, and delete the signed-in user's
-tasks. Semantic retrieval can find related tasks when exact wording is not
-known.
+TaskFlow is a cloud-oriented task manager with an AI assistant. It combines a
+Streamlit interface, FastAPI services, Supabase Auth and PostgreSQL, pgvector
+retrieval, and a LangGraph tool workflow. Gemini is the default model provider;
+OpenRouter and Groq are configurable alternatives with bounded fallback.
 
 ## Features
 
-- Create, view, edit, complete, and delete tasks.
-- Track task status, priority, and due date.
-- Search and filter tasks from the Streamlit workspace.
-- Ask the AI assistant to find or manage tasks.
-- Validate model-generated tool arguments and enforce task ownership in backend
-  services.
-- Retrieve semantically related tasks using embeddings and pgvector.
-- Save chat history per authenticated account.
-- Authenticate with Supabase email/password or optional Google sign-in.
-- Trace API, model, embedding, retrieval, and tool execution with OpenTelemetry
-  and Arize Phoenix.
+- Authenticated, user-scoped task creation, search, editing, completion, and deletion.
+- Persistent conversations, chronological messages, rename and delete controls.
+- Validated AI task tools and semantic retrieval over Gemini embeddings in pgvector.
+- Central model routing, bounded retries, provider failover, timeouts, and cooldowns.
+- OpenTelemetry traces that can be exported to a separately hosted Phoenix instance.
+- Alembic migrations, Docker deployment configuration, and pytest/Ruff CI.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    User[User] --> UI[Streamlit frontend]
-    UI -->|Email auth / Google PKCE| Auth[Supabase Auth]
-    UI -->|Bearer token| API[FastAPI]
-    API -->|Validate token and derive user ID| Auth
-    API --> Tasks[Task and conversation services]
-    Tasks --> DB[(Supabase PostgreSQL)]
-    API --> Agent[LangGraph workflow]
-    Agent --> Router[Model routing]
-    Router --> Gemini[Google Gemini via google-genai]
-    Router --> Ollama[Local Ollama]
-    Agent --> Tools[Validated task tools]
+    User --> Streamlit
+    Streamlit -->|Supabase access token| FastAPI
+    FastAPI -->|Validate identity| SupabaseAuth[Supabase Auth]
+    FastAPI --> Tasks[Task and conversation services]
+    Tasks --> Postgres[(Supabase PostgreSQL)]
+    Agent[LangGraph] --> Router[Central model router]
+    FastAPI --> Agent
+    Router -->|Primary| Gemini[Gemini API]
+    Router -. fallback .-> OpenRouter[OpenRouter API]
+    Router -. fallback .-> Groq[Groq Cloud API]
+    Agent --> Tools[Validated application tools]
     Tools --> Tasks
-    Agent --> Retrieval[User-scoped semantic retrieval]
-    Retrieval --> Embed[Embedding provider]
-    Retrieval --> Vector[(pgvector)]
-    Vector --> DB
-    API -. traces .-> OTel[OpenTelemetry]
+    Agent --> Retrieval[User-scoped RAG]
+    Retrieval --> GeminiEmbed[Gemini embeddings, 768 dimensions]
+    GeminiEmbed --> Vectors[(pgvector in PostgreSQL)]
+    OTel[OpenTelemetry OTLP] --> Phoenix[Hosted Phoenix]
+    FastAPI -. traces .-> OTel
+    Router -. traces .-> OTel
     Agent -. traces .-> OTel
-    OTel --> Phoenix[Arize Phoenix]
 ```
 
-The frontend sends a Supabase access token to FastAPI. The backend validates
-that token with Supabase Auth and uses the returned user identity for all task,
-conversation, and retrieval queries. Clients and AI tools cannot set the owner
-ID. The agent selects a configured model, validates any tool arguments, then
-calls the same user-scoped service functions used by the task API.
+The backend validates the Supabase bearer token and derives the owner ID. Every
+task, conversation, message, and semantic search is scoped to that identity.
+LangGraph asks the router for model output, then executes validated tools in a
+separate node. Provider retries and fallback only wrap model generation; a
+fallback response does not re-enter the previous tool node. The selected
+provider stays attached to the workflow after a fallback so a later agent turn
+does not restart with the failed primary.
 
-Task embeddings are stored in PostgreSQL using pgvector. Similarity queries
-filter on the authenticated user's ID before task records are loaded. Embeddings
-must be regenerated if the embedding provider or model changes.
+The previous conversation issue came from persisting the user message before
+generation completed and relying on Streamlit session state for the immediate
+view. A failure could leave half a turn. The API now commits user and assistant
+messages together only after success; the database transcript is reloaded when
+opening a conversation and is the source of display/history context. LangGraph
+is invoked with that conversation's recent message history on each request; no
+separate checkpoint store is used.
 
-OpenTelemetry records request, model, embedding, retrieval, and tool spans.
-When configured, the OTLP exporter sends spans to Phoenix. Prompts, task text,
-access tokens, and provider keys are not deliberately added to span attributes.
+PostgreSQL is the source of truth. Gemini `gemini-embedding-001` vectors remain
+768-dimensional; switching embedding model requires a deliberate re-embedding
+plan. The pgvector HNSW cosine index supports the existing similarity query.
 
-## Technology stack
+## Providers and routing
 
-| Technology | Purpose |
+`DEFAULT_AI_PROVIDER=gemini`. `AI_CHAT_PROVIDER` may explicitly select
+`gemini`, `openrouter`, or `groq`; `AI_COMPLEX_PROVIDER` and
+`AI_IMPORTANT_PROVIDER` optionally select a provider for classified requests.
+The built-in classifier is deliberately small and can be adjusted in
+`app/services/model_router.py`. `AI_FALLBACK_PROVIDERS` sets candidate order;
+remaining configured providers are considered after those preferences.
+
+The configured alternatives are `google/gemma-4-31b-it:free` on OpenRouter and
+`qwen/qwen3.8-27b` on Groq. Provider support is checked against current vendor
+catalogues and documented in [operations](docs/OPERATIONS.md). Groq currently
+labels Qwen 3.8 27B as Preview. No provider's credentials or availability have
+been exercised by the unit-test suite. Missing credentials and permanent model
+errors do not trigger repeated requests; transient throttles, 5xx responses,
+connection errors, and timeouts have bounded retry/fallback handling.
+
+## Technology
+
+| Layer | Technology |
 | --- | --- |
-| Python 3.11+ | Application runtime |
-| FastAPI and Uvicorn | Authenticated REST API |
-| Streamlit | Dashboard, task management, and chat UI |
-| Supabase Auth | Email/password and optional Google identity |
-| PostgreSQL and pgvector | Durable task, conversation, message, and vector storage |
-| SQLAlchemy and Alembic | ORM sessions and schema migrations |
-| LangGraph | Bounded assistant/tool workflow |
-| Google GenAI SDK | Native Gemini calls and function calling |
-| Ollama and OpenAI client | Local model endpoint support |
-| OpenTelemetry and Arize Phoenix | Tracing and AI workflow inspection |
-| Ragas | Retrieval and answer evaluation workflow |
-| Pytest, HTTPX, and Ruff | Tests and code quality checks |
-| Docker and GitHub Actions | Container build and CI checks |
+| Frontend | Streamlit |
+| API and server | FastAPI, Uvicorn |
+| Identity | Supabase Auth email/password |
+| Database | Supabase PostgreSQL, SQLAlchemy, Alembic |
+| Vector search | pgvector, Gemini embeddings |
+| Agent | LangGraph, Pydantic-validated tools |
+| Models | Gemini, OpenRouter, Groq Cloud |
+| Tracing | OpenTelemetry OTLP/HTTP, Arize Phoenix |
+| Evaluation | Ragas (development group) |
+| Quality | Pytest, HTTPX, Ruff, GitHub Actions |
+| Deployment | Docker on Render; Streamlit Community Cloud |
 
 ## Project structure
 
 ```text
-app/
-  agent/          LangGraph state, tools, and workflow
-  api/            FastAPI task, chat, and Google sign-in routes
-  core/           Settings, auth, logging, rate limits, and telemetry
-  evaluation/     Ragas dataset, retrieval, answer generation, and metrics
-  services/       Task, conversation, model, and vector services
-migrations/       Alembic schema history
-tests/            API, auth, agent, routing, reliability, and vector tests
-ui/               Streamlit application
-docs/             Local operations and provider setup
-main.py           FastAPI application entry point
-run_evaluation.py Ragas evaluation entry point
+app/agent/       LangGraph state, workflow, and task tools
+app/api/         FastAPI task and chat routes
+app/core/        Settings, authentication, logging, rate limits, telemetry
+app/evaluation/  Ragas datasets and evaluation pipeline
+app/services/    Tasks, conversations, provider routing, LLM, vectors
+migrations/      Alembic schema history
+tests/           Unit and API tests with provider mocks
+ui/              Streamlit application entry point
+docs/            Operations, provider, and deployment notes
+main.py          FastAPI app
+Dockerfile       Render-compatible backend container
+render.yaml      Render service blueprint (manual deploy)
+requirements.txt Streamlit Community Cloud frontend dependencies
 ```
 
-## Getting started
+## Local development
 
-### Prerequisites
-
-- Python 3.11 or newer and `uv`.
-- A Supabase project with Auth enabled and a PostgreSQL connection string.
-- Either a Gemini API key or a running Ollama instance with a chat model and an
-  embedding model installed.
-
-### Install and configure
+Requirements: Python 3.11+, `uv`, a Supabase project, and a PostgreSQL database
+with the pgvector extension for semantic search. AI calls use cloud APIs; TaskFlow
+does not run local model inference.
 
 ```powershell
-git clone <repository-url>
-cd TaskFlow
 Copy-Item .env.example .env
+Copy-Item .env.frontend.example .env.frontend
 uv sync --all-groups
 ```
 
-Set the values listed in the next section. Before running migrations, confirm
-that `DATABASE_URL` points to the intended development database. Then run:
+Set backend values in `.env` and the API URL/public Supabase values in
+`.env.frontend`. Streamlit reads only `.env.frontend`; backend database and AI
+provider secrets stay in `.env`. Point `DATABASE_URL` at a development database,
+then apply migrations:
 
 ```powershell
 uv run alembic upgrade head
 ```
 
-To use local Ollama, start Ollama and pull the configured models, for example:
-
-```powershell
-ollama pull qwen2.5:3b
-ollama pull nomic-embed-text
-```
-
-### Start the application
-
-Start the backend:
+Run API and UI in separate terminals:
 
 ```powershell
 uv run uvicorn main:app --reload
-```
-
-Start Streamlit in another terminal:
-
-```powershell
 uv run streamlit run ui/streamlit_app.py
 ```
 
-Open `http://localhost:8501` for TaskFlow, `http://localhost:8000/docs` for the
-API reference, and `http://localhost:8000/health` for the backend/database
-health check.
+Open `http://localhost:8501`; API docs are at `http://localhost:8000/docs` and
+the database health check is `http://localhost:8000/health`. In production,
+`APP_ENVIRONMENT=production` rejects SQLite so the API cannot silently rely on
+ephemeral local storage.
 
 ## Environment variables
 
-Use the [`.env.example`](.env.example) file as the template. It contains
-placeholders only.
+Copy `.env.example`; never commit `.env`. Set provider and database secrets on
+the backend only. Streamlit receives only the API URL and public Supabase Auth
+project values.
 
-| Variable | Purpose |
-| --- | --- |
-| `DATABASE_URL` | PostgreSQL connection used by FastAPI and Alembic |
-| `SUPABASE_URL` | Supabase project URL used by the backend and frontend |
-| `SUPABASE_ANON_KEY` | Public Supabase Auth client key; never use a service-role key here |
-| `TASKFLOW_API_URL` | FastAPI base URL used by Streamlit; defaults to local port 8000 |
-| `AI_PROVIDER` | Default chat and embedding provider: `ollama` or `gemini` |
-| `AI_CHAT_PROVIDER` | Optional chat provider override |
-| `AI_EMBEDDING_PROVIDER` | Optional embedding provider override |
-| `AI_FALLBACK_PROVIDER` | Optional provider for transient failure fallback |
-| `OLLAMA_BASE_URL` | OpenAI-compatible local Ollama endpoint |
-| `OLLAMA_MODEL` | Ollama chat model name |
-| `OLLAMA_EMBEDDING_MODEL` | Ollama embedding model name |
-| `GEMINI_API_KEY` | Backend-only Gemini credential |
-| `GEMINI_MODEL` | Gemini chat model name |
-| `GEMINI_EMBEDDING_MODEL` | Gemini embedding model name |
-| `AI_TIMEOUT_SECONDS` | External model request timeout |
-| `AI_RETRY_ATTEMPTS` | Maximum attempts for retryable provider failures |
-| `AI_RETRY_BASE_SECONDS` | Exponential retry delay base |
-| `AI_EMBEDDING_CACHE_TTL_SECONDS` | In-memory embedding cache expiration |
-| `AI_EMBEDDING_CACHE_MAX_ENTRIES` | Maximum in-memory cache entries |
-| `SUPABASE_GOOGLE_SIGNIN_ENABLED` | Enables the optional Google sign-in route |
-| `GOOGLE_SIGNIN_REDIRECT_URI` | Frontend callback origin for Google sign-in |
-| `PHOENIX_ENDPOINT` | Optional Phoenix host; exporter appends `/v1/traces` |
-| `PHOENIX_API_KEY` | Optional key for a protected Phoenix endpoint |
-| `CORS_ORIGINS` | Comma-separated frontend origins allowed by FastAPI |
+| Variable | Used by | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | Backend | PostgreSQL/pgvector connection string with TLS |
+| `DATABASE_POOL_SIZE`, `DATABASE_MAX_OVERFLOW` | Backend | SQLAlchemy pool limits |
+| `SUPABASE_URL`, `SUPABASE_ANON_KEY` | Backend and UI | Validate sessions and use email/password Auth |
+| `DEFAULT_AI_PROVIDER` | Backend | Defaults to `gemini` |
+| `AI_CHAT_PROVIDER` | Backend | Optional provider override for chat |
+| `AI_COMPLEX_PROVIDER`, `AI_IMPORTANT_PROVIDER` | Backend | Optional task classification preferences |
+| `AI_FALLBACK_PROVIDERS` | Backend | Ordered candidates, default `openrouter,groq` |
+| `GEMINI_API_KEY`, `GEMINI_MODEL` | Backend | Primary model credentials and chat model |
+| `GEMINI_EMBEDDING_MODEL` | Backend | Existing 768-dimension vector model |
+| `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | Backend | OpenRouter alternative |
+| `GROQ_API_KEY`, `GROQ_MODEL` | Backend | Groq alternative |
+| `AI_TIMEOUT_SECONDS`, `AI_RETRY_ATTEMPTS`, `AI_RETRY_BASE_SECONDS` | Backend | Request and bounded retry behavior |
+| `AI_FAILURE_THRESHOLD`, `AI_COOLDOWN_SECONDS` | Backend | In-process provider cooldown |
+| `PHOENIX_ENDPOINT`, `PHOENIX_API_KEY` | Backend | Optional hosted Phoenix OTLP endpoint and auth |
+| `CORS_ORIGINS` | Backend | Comma-separated allowed frontend origins |
+| `TASKFLOW_API_URL` | UI | FastAPI URL; set the deployed Render URL in Cloud |
 
-The database URL, Gemini key, and any Phoenix key belong only in backend
-configuration. Streamlit needs the Supabase URL and public anon key to support
-email authentication, plus `TASKFLOW_API_URL`.
+## Database, authentication, and security
 
-## Testing and code quality
+Supabase Auth email/password remains the only account sign-in method. FastAPI
+validates access tokens with Supabase Auth. Service queries derive the user ID
+from that validated identity, never from a client-supplied owner field. The
+Alembic schema enables RLS for user records and creates pgvector storage and
+indexes. The app also enforces ownership in its SQLAlchemy service layer.
+
+Migration `0003` drops only `oauth_states`, a short-lived PKCE table used by
+retired Google sign-in; it does not drop tasks, conversations, messages, or
+migration `0004` adds message-order and vector-search indexes; `0005` adds a
+conversation activity timestamp and owner/activity index. Review
+migrations against the target database before running them. No production
+database was accessed or modified during this work.
+
+Task tools accept Pydantic-validated arguments and call application services;
+the agent has no arbitrary SQL tool. Keep database passwords, service-role keys,
+and AI provider keys out of Streamlit secrets and source control. The frontend
+uses only the public Supabase anon/publishable key.
+
+## Tests and code quality
 
 ```powershell
 uv run pytest -q
 uv run ruff check .
+uv run ruff format --check .
 ```
 
-Tests cover task CRUD and cross-user access, Supabase token validation, chat
-conversation ownership, model tool argument validation, model routing, retries,
-embedding cache isolation/invalidation, and user-scoped vector retrieval. The
-suite mocks external providers and does not verify live Gemini, Supabase, or
-Google OAuth credentials.
+Tests use mocked model calls. They cover authenticated task operations,
+ownership, conversation controls, provider selection/retries/fallback, tool
+argument validation, embedding cache isolation, and vector-query scoping. Live
+provider, Supabase, database, and Phoenix service calls require separate
+credentials and are not claimed as verified by unit tests.
 
-Ragas evaluation is a separate workflow:
+Ragas evaluation is an opt-in development workflow; it requires a configured
+provider and a development Supabase/PostgreSQL dataset. Do not run it against
+production data without explicit review.
 
-```powershell
-$env:TASKFLOW_EVAL_USER_ID = "<development-user-id>"
-uv run python run_evaluation.py
-```
+## Phoenix observability
 
-It requires a development account with suitable tasks, PostgreSQL/pgvector, and
-a configured model provider. It is not part of the test suite.
-
-## Observability
-
-Start Phoenix locally in one terminal:
-
-```powershell
-uv run phoenix serve
-```
-
-Set the backend environment variable and start FastAPI in another terminal:
-
-```powershell
-$env:PHOENIX_ENDPOINT = "http://localhost:6006"
-uv run uvicorn main:app --reload
-```
-
-Open the Phoenix dashboard at `http://localhost:6006`. OTLP traces are sent to
-`http://localhost:6006/v1/traces`. Inspect the `taskflow` project for API,
-provider, embedding, retrieval, retry, and tool spans. This local setup and a
-SQLite-backed API health request were verified during development.
+Set `PHOENIX_ENDPOINT` to the HTTPS OTLP/HTTP base URL for a hosted or separately
+deployed Phoenix receiver. TaskFlow appends `/v1/traces` unless that path is
+already present. If the receiver requires authentication, set
+`PHOENIX_API_KEY`. Configure the matching receiver URL and key in the Phoenix
+host's deployment settings. Phoenix can then display incoming FastAPI requests,
+model/provider attempts, fallback decisions, LangGraph nodes, tools, embeddings,
+retrieval, latency, and errors. TaskFlow avoids recording prompts, secrets, and
+access tokens as trace attributes. Trace export is optional and failure does not
+prevent API startup. Trace delivery has not been verified without a hosted
+Phoenix endpoint and credentials.
 
 ## Deployment
 
-The repository is configured for a FastAPI backend on Render and a Streamlit
-frontend on Streamlit Community Cloud, with Supabase PostgreSQL/Auth as shared
-managed services. These hosting targets are not deployed or verified here.
+No service is deployed from this workspace. See [deployment and operations](docs/OPERATIONS.md)
+for exact manual setup.
 
-For Render, set backend database, Supabase, provider, CORS, and optional Phoenix
-variables. The Docker entry point applies Alembic migrations before Uvicorn
-starts; point it at the intended database and review migrations before deploy.
-For Streamlit Community Cloud, set `TASKFLOW_API_URL`, `SUPABASE_URL`, and
-`SUPABASE_ANON_KEY` in the app's secrets. Add the frontend origin to backend
-`CORS_ORIGINS`.
+- **Render backend:** use the `render.yaml` blueprint or configure the Docker
+  web service manually. Set the environment values in Render; the container
+  binds `0.0.0.0:$PORT`, applies Alembic migrations, and exposes `/health`.
+  `autoDeploy` is disabled in the blueprint.
+- **Streamlit Community Cloud:** deploy `ui/streamlit_app.py`. Configure
+  `TASKFLOW_API_URL`, `SUPABASE_URL`, and `SUPABASE_ANON_KEY` in its Secrets page.
+  Set `TASKFLOW_API_URL` to the public Render API URL, never `localhost`.
+- **Supabase:** use the PostgreSQL pooler URL with TLS, enable pgvector, and
+  configure Auth email/password settings and allowed frontend URLs.
+- **CORS:** set `CORS_ORIGINS` on Render to the exact Streamlit app origin(s).
 
-## Security considerations
+## Future work
 
-- FastAPI validates Supabase bearer tokens and derives the owner ID from the
-  verified user response.
-- Task, conversation, and vector service queries filter by that owner. The
-  PostgreSQL migration also configures row-level security policies for user data.
-- Model-generated tool arguments are validated against Pydantic schemas; tools
-  call application services and do not execute arbitrary SQL.
-- Keep Supabase service-role credentials, Gemini keys, and database passwords
-  out of Streamlit configuration and Git.
-- OAuth state is short-lived and consumed once during Google sign-in.
-- Provider logging and tracing retain operational errors and latency without
-  intentionally recording prompts, private task text, or credentials.
-
-## Future improvements
-
-- Add disposable PostgreSQL/pgvector integration tests to CI.
-- Add backend task-count and server-side search endpoints if client-side
-  pagination needs to scale beyond a personal workspace.
-- Add a documented recovery flow for expired Supabase sessions.
+- Run PostgreSQL/pgvector integration tests in CI with a disposable service.
+- Add durable shared circuit-breaker state if deploying multiple API instances.
+- Measure production UI/API request counts before introducing caching.
+- Verify end-to-end provider fallback, Phoenix delivery, and hosted auth after
+  deployment credentials are configured.

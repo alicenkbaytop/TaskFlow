@@ -1,9 +1,7 @@
 from app.services.llm_service import (
-    AI_PROVIDER,
-    MODEL_NAME,
-    generate_gemini_message,
-    get_llm_client,
+    generate_chat_message,
 )
+from app.services.model_router import generate_with_fallback, provider_order
 
 
 def generate_contextual_answer(question: str, contexts: list[str]) -> str:
@@ -21,12 +19,8 @@ def generate_contextual_answer(question: str, contexts: list[str]) -> str:
             "content": f"Task information:\n{context_text}\n\nQuestion: {question}",
         },
     ]
-    if AI_PROVIDER == "gemini":
-        response = generate_gemini_message(messages, [])
-        return response["content"]
-
-    response = get_llm_client().chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages,
+    response, _ = generate_with_fallback(
+        lambda route: generate_chat_message(route, messages, []),
+        routes=provider_order("evaluation"),
     )
-    return response.choices[0].message.content or ""
+    return response.get("content", "")

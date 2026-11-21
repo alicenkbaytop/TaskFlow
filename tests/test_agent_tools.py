@@ -1,3 +1,5 @@
+import json
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -32,3 +34,64 @@ def test_model_cannot_supply_an_owner_id():
         arguments={"title": "Forged task", "user_id": "victim"},
     )
     assert result["error"] == "Invalid tool arguments"
+
+
+def test_tool_action_is_deduplicated_across_fallback_responses(monkeypatch):
+    from app.agent import workflow
+
+    calls = []
+
+    class FakeSession:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(workflow, "SessionLocal", FakeSession)
+
+    def execute_tool(**kwargs):
+        calls.append(kwargs)
+        return {"id": 7, "title": "Launch plan"}
+
+    monkeypatch.setattr(workflow, "execute_tool", execute_tool)
+    args = '{"title":"Launch plan","priority":"high"}'
+    first_state = {
+        "conversation_id": 1,
+        "user_id": "owner-a",
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "primary-call",
+                        "function": {"name": "create_task", "arguments": args},
+                    }
+                ],
+            }
+        ],
+        "answer": "",
+        "tool_rounds": 0,
+        "executed_tools": {},
+    }
+    first = workflow.tool_node(first_state)
+    fallback_state = {
+        **first_state,
+        "messages": first["messages"]
+        + [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "fallback-call",
+                        "function": {"name": "create_task", "arguments": args},
+                    }
+                ],
+            }
+        ],
+        "executed_tools": first["executed_tools"],
+        "tool_rounds": first["tool_rounds"],
+    }
+    second = workflow.tool_node(fallback_state)
+    assert len(calls) == 1
+    assert json.loads(second["messages"][-1]["content"]) == {
+        "id": 7,
+        "title": "Launch plan",
+    }

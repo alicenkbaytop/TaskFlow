@@ -1,27 +1,51 @@
-from ragas.llms import llm_factory
+"""Ragas adapter that sends evaluator generations through TaskFlow's router."""
 
-from app.services.llm_service import (
-    AI_PROVIDER,
-    MODEL_NAME,
-    get_gemini_client,
-    get_llm_client,
-)
+import asyncio
+import json
+
+from pydantic import ValidationError
+from ragas.llms.base import InstructorBaseRagasLLM
+
+from app.services.llm_service import generate_chat_message
+from app.services.model_router import generate_with_fallback, provider_order
+
+
+class RoutedEvaluationLLM(InstructorBaseRagasLLM):
+    def generate(self, prompt: str, response_model):
+        schema = response_model.model_json_schema()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Return a JSON object that matches the supplied response schema. "
+                    "Use only the supplied evaluation prompt."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        def generate_and_validate(route):
+            response = generate_chat_message(
+                route, messages, [], response_schema=schema
+            )
+            try:
+                return response_model.model_validate_json(response.get("content", ""))
+            except (ValidationError, json.JSONDecodeError) as error:
+                invalid_output = ValueError(
+                    f"{route.provider} returned invalid structured output"
+                )
+                invalid_output.status_code = 422
+                raise invalid_output from error
+
+        result, _route = generate_with_fallback(
+            generate_and_validate,
+            routes=provider_order("evaluation"),
+        )
+        return result
+
+    async def agenerate(self, prompt: str, response_model):
+        return await asyncio.to_thread(self.generate, prompt, response_model)
 
 
 def create_evaluator_llm():
-
-    if AI_PROVIDER == "gemini":
-        client = get_gemini_client()
-        provider = "google"
-    else:
-        client = get_llm_client()
-        provider = "openai"
-
-    # Create an LLM that Ragas can use for evaluation
-    evaluator_llm = llm_factory(
-        MODEL_NAME,
-        provider=provider,
-        client=client,
-    )
-
-    return evaluator_llm
+    return RoutedEvaluationLLM()

@@ -3,9 +3,14 @@ from datetime import date
 
 import requests
 import streamlit as st
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+_frontend_settings = dotenv_values(
+    os.path.join(os.path.dirname(__file__), "..", ".env.frontend")
+)
+for _name in ("TASKFLOW_API_URL", "SUPABASE_URL", "SUPABASE_ANON_KEY"):
+    if _name not in os.environ and _frontend_settings.get(_name):
+        os.environ[_name] = _frontend_settings[_name]
 
 
 def setting(name: str, default: str = "") -> str:
@@ -196,25 +201,6 @@ def show_authentication() -> None:
         st.error("Configure SUPABASE_URL and SUPABASE_ANON_KEY for the frontend.")
         st.stop()
 
-    callback_code = st.query_params.get("code")
-    callback_state = st.query_params.get("auth_state")
-    if st.query_params.get("error"):
-        st.error("Google sign-in was cancelled or could not be completed.")
-        st.query_params.clear()
-    if callback_code and callback_state:
-        try:
-            response = requests.post(
-                f"{API_URL}/auth/google/exchange",
-                json={"code": callback_code, "state": callback_state},
-                timeout=20,
-            )
-            response.raise_for_status()
-            save_session(response.json())
-            st.query_params.clear()
-            st.rerun()
-        except requests.RequestException as error:
-            st.error(f"Google sign-in could not be completed: {error}")
-
     with st.container(border=True):
         auth_mode = st.radio("Account", ["Sign in", "Create account"], horizontal=True)
         with st.form("auth_form"):
@@ -266,15 +252,6 @@ def show_authentication() -> None:
                     ),
                 }
                 st.error(messages.get(code, f"Authentication failed: {error}"))
-
-        st.divider()
-        if st.button("Continue with Google", use_container_width=True):
-            try:
-                response = requests.post(f"{API_URL}/auth/google/start", timeout=10)
-                response.raise_for_status()
-                st.link_button("Open Google sign-in", response.json()["url"])
-            except requests.RequestException:
-                st.info("Google sign-in is not enabled for this TaskFlow instance.")
 
 
 def fetch_tasks() -> list[dict]:
@@ -615,9 +592,14 @@ def render_assistant() -> None:
         )
     with new_col:
         if st.button("＋ New chat", use_container_width=True):
-            st.session_state.active_conversation_id = None
-            st.session_state.chat_history = []
-            st.rerun()
+            try:
+                conversation = api_request("POST", "/chat/conversations").json()
+                st.session_state.active_conversation_id = conversation["id"]
+                st.session_state.conversation_picker = conversation["id"]
+                st.session_state.chat_history = []
+                st.rerun()
+            except requests.RequestException as error:
+                st.error(f"Could not create a conversation: {error}")
 
     try:
         conversations = load_conversations()
@@ -661,6 +643,35 @@ def render_assistant() -> None:
                     st.error(f"Could not load this conversation: {error}")
                     st.session_state.chat_history = []
 
+        active_id = st.session_state.get("active_conversation_id")
+        if active_id is not None:
+            with st.expander("Conversation settings"):
+                active_title = conversation_by_id[active_id].get("title", "")
+                with st.form(f"rename_conversation_{active_id}"):
+                    title = st.text_input("Conversation name", value=active_title)
+                    rename = st.form_submit_button("Save name")
+                if rename:
+                    try:
+                        api_request(
+                            "PATCH",
+                            f"/chat/conversations/{active_id}",
+                            json={"title": title.strip()},
+                        )
+                        st.rerun()
+                    except requests.RequestException as error:
+                        st.error(f"Could not rename conversation: {error}")
+                if st.button(
+                    "Delete conversation", key=f"delete_conversation_{active_id}"
+                ):
+                    try:
+                        api_request("DELETE", f"/chat/conversations/{active_id}")
+                        st.session_state.active_conversation_id = None
+                        st.session_state.conversation_picker = None
+                        st.session_state.chat_history = []
+                        st.rerun()
+                    except requests.RequestException as error:
+                        st.error(f"Could not delete conversation: {error}")
+
     history = st.session_state.get("chat_history", [])
     if not history:
         with st.container(border=True):
@@ -678,6 +689,7 @@ def render_assistant() -> None:
     prompt = st.chat_input("Message TaskFlow…")
     if prompt:
         st.session_state.chat_history.append({"role": "user", "content": prompt})
+        sent_ok = False
         with st.chat_message("user"):
             st.markdown(prompt)
         with st.chat_message("assistant"), st.spinner("Working through your request…"):
@@ -698,14 +710,20 @@ def render_assistant() -> None:
                 st.session_state.chat_history.append(
                     {"role": "assistant", "content": result["answer"]}
                 )
+                sent_ok = True
             except requests.HTTPError as error:
                 detail = (
-                    error.response.text if error.response is not None else str(error)
+                    error.response.json().get("detail", "The request failed.")
+                    if error.response is not None
+                    else str(error)
                 )
                 st.error(f"The backend could not answer this request: {detail}")
             except requests.RequestException as error:
                 st.error(f"Could not connect to the AI assistant: {error}")
-        st.rerun()
+        if sent_ok:
+            st.rerun()
+        else:
+            st.session_state.chat_history.pop()
 
 
 def main() -> None:
@@ -751,6 +769,10 @@ def main() -> None:
                 st.session_state.pop(key, None)
             st.rerun()
 
+    if page == "AI Assistant":
+        render_assistant()
+        return
+
     try:
         tasks = fetch_tasks()
     except requests.RequestException as error:
@@ -765,8 +787,6 @@ def main() -> None:
         render_dashboard(tasks)
     elif page == "My Tasks":
         render_tasks(tasks)
-    else:
-        render_assistant()
 
 
 if __name__ == "__main__":

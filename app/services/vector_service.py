@@ -10,8 +10,13 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models import TaskEmbedding
-from app.services.model_router import fallback_route, resolve_route
-from app.services.provider_reliability import is_retryable_provider_error, with_retries
+from app.services.model_router import (
+    generate_with_fallback,
+    provider_is_configured,
+    provider_order,
+    resolve_route,
+)
+from app.services.provider_reliability import with_retries
 
 EMBEDDING_DIMENSIONS = 768
 logger = logging.getLogger(__name__)
@@ -25,11 +30,7 @@ _cache_misses = 0
 
 
 def embedding_provider_configured() -> bool:
-    settings = get_settings()
-    provider = resolve_route("embedding").provider
-    return provider == "ollama" or (
-        provider == "gemini" and bool(settings.gemini_api_key)
-    )
+    return provider_is_configured(resolve_route("embedding"))
 
 
 def _cache_key(user_id: str | None, provider: str, model: str, text: str):
@@ -89,21 +90,7 @@ def embedding_cache_info() -> dict[str, int]:
 
 def _request_embedding(route, text: str):
     settings = get_settings()
-    if route.provider == "ollama":
-        from openai import OpenAI
-
-        client = OpenAI(
-            api_key="ollama",
-            base_url=f"{settings.ollama_base_url.rstrip('/')}/",
-            timeout=settings.ai_timeout_seconds,
-            max_retries=0,
-        )
-        result = client.embeddings.create(
-            model=route.model,
-            input=text,
-        )
-        vector = result.data[0].embedding
-    elif route.provider == "gemini":
+    if route.provider == "gemini":
         if not settings.gemini_api_key:
             raise RuntimeError("GEMINI_API_KEY is not configured")
         from google import genai
@@ -154,23 +141,15 @@ def create_embedding(text: str, user_id: str | None = None) -> list[float]:
         span.set_attribute("cache.hit", False)
         actual_route = route
         try:
-            try:
-                vector, attempts = with_retries(
-                    lambda: _request_embedding(route, text),
+            (vector, attempts), actual_route = generate_with_fallback(
+                lambda candidate: with_retries(
+                    lambda: _request_embedding(candidate, text),
                     attempts=settings.ai_retry_attempts,
                     base_delay_seconds=settings.ai_retry_base_seconds,
-                )
-            except Exception as primary_error:
-                backup = fallback_route(route)
-                if not backup or not is_retryable_provider_error(primary_error):
-                    raise
-                actual_route = backup
-                vector, attempts = with_retries(
-                    lambda: _request_embedding(actual_route, text),
-                    attempts=settings.ai_retry_attempts,
-                    base_delay_seconds=settings.ai_retry_base_seconds,
-                )
-                span.set_attribute("ai.fallback_used", True)
+                ),
+                routes=provider_order("embedding", route.provider),
+            )
+            span.set_attribute("ai.fallback_used", actual_route != route)
             duration = (time.perf_counter() - start) * 1000
             span.set_attribute("ai.retry_count", attempts - 1)
             span.set_attribute("ai.success", True)
@@ -215,16 +194,30 @@ def delete_task_vector(db: Session, task_id: int):
 def search_similar_tasks(db: Session, user_id: str, query: str, limit: int = 5):
     if db.bind.dialect.name != "postgresql":
         raise RuntimeError("Semantic search requires PostgreSQL with pgvector")
-    vector = create_embedding(query, user_id=user_id)
-    distance = TaskEmbedding.embedding.cosine_distance(vector)
-    rows = db.execute(
-        select(TaskEmbedding, distance.label("distance"))
-        .where(TaskEmbedding.user_id == user_id)
-        .order_by(distance)
-        .limit(limit)
-    ).all()
-    return [
-        {"task_id": row.task_id, "score": 1 - float(distance)}
-        for row, distance in rows
-        if distance is not None
-    ]
+    start = time.perf_counter()
+    with tracer.start_as_current_span("ai.retrieval") as span:
+        try:
+            vector = create_embedding(query, user_id=user_id)
+            distance = TaskEmbedding.embedding.cosine_distance(vector)
+            rows = db.execute(
+                select(TaskEmbedding, distance.label("distance"))
+                .where(TaskEmbedding.user_id == user_id)
+                .order_by(distance)
+                .limit(limit)
+            ).all()
+            results = [
+                {"task_id": row.task_id, "score": 1 - float(distance)}
+                for row, distance in rows
+                if distance is not None
+            ]
+            span.set_attribute("retrieval.result_count", len(results))
+            span.set_attribute("retrieval.success", True)
+            return results
+        except Exception as error:
+            span.set_attribute("retrieval.success", False)
+            span.set_attribute("error.type", type(error).__name__)
+            raise
+        finally:
+            span.set_attribute(
+                "retrieval.latency_ms", (time.perf_counter() - start) * 1000
+            )
